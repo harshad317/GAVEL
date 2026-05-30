@@ -104,6 +104,30 @@ def print_run_summary(summary: Mapping[str, Any]) -> None:
     console.print(table)
 
 
+def print_selection_summary(manifest: Mapping[str, Any]) -> None:
+    table = Table(title="Leakage-Safe Split Selection", box=box.SIMPLE_HEAVY, header_style="bold green")
+    table.add_column("Split", style="bold cyan")
+    table.add_column("Requested", justify="right")
+    table.add_column("Selected", justify="right", style="green")
+    table.add_column("Pool", justify="right")
+    table.add_column("Skipped", justify="right", style="yellow")
+    table.add_column("Derived", style="dim")
+    for split_name in ("train", "validation", "test"):
+        split = (manifest.get("splits") or {}).get(split_name, {})
+        table.add_row(
+            split_name,
+            "all" if split.get("requested") is None else str(split.get("requested")),
+            str(split.get("selected", 0)),
+            str(split.get("candidate_pool", 0)),
+            str(split.get("skipped_for_leakage", 0)),
+            str(split.get("derived_from", "")),
+        )
+    check = manifest.get("leakage_check", {})
+    caption = "Leakage check: passed" if check.get("passed") else "Leakage check: not run"
+    table.caption = caption
+    console.print(table)
+
+
 def print_config_table(title: str, rows: Mapping[str, Any]) -> None:
     table = Table(title=title, box=box.SIMPLE, header_style="bold cyan")
     table.add_column("Option", style="bold")

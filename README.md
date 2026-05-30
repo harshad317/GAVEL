@@ -117,10 +117,17 @@ python3 experiments/run_dspy_mipro.py \
   --program cot \
   --model openai/gpt-4o-mini \
   --train-dataset data/benchmarks/gsm8k-train.jsonl \
-  --eval-dataset data/benchmarks/gsm8k-test.jsonl \
+  --test-dataset data/benchmarks/gsm8k-test.jsonl \
+  --train-n 50 \
+  --val-n 50 \
+  --test-n 500 \
   --auto light \
   --out output/baselines/gsm8k_mipro
 ```
+
+`--train-n`, `--val-n`, and `--test-n` select deterministic, leakage-checked
+subsets. The runner rejects overlaps by `example_id` and by normalized prompt
+fingerprint before calling DSPy/MIPROv2.
 
 The runner follows the official DSPy GitHub API: `dspy.LM`,
 `dspy.configure`, `dspy.Predict` / `dspy.ChainOfThought`, and

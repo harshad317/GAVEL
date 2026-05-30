@@ -17,9 +17,11 @@ from pact_el.baselines.dspy_mipro import (
     load_examples,
     run_dspy_baseline,
 )
+from pact_el.benchmarks.splitting import select_three_way
 from pact_el.ux import (
     install_rich_tracebacks,
     print_config_table,
+    print_selection_summary,
     print_run_summary,
     print_title,
 )
@@ -27,7 +29,8 @@ from pact_el.ux import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--eval-dataset", required=True, help="Normalized benchmark JSONL to evaluate.")
+    parser.add_argument("--eval-dataset", help="Normalized benchmark JSONL to evaluate. Alias: --test-dataset.")
+    parser.add_argument("--test-dataset", help="Normalized benchmark JSONL used as the held-out test set.")
     parser.add_argument("--train-dataset", help="Normalized benchmark JSONL used by MIPROv2.")
     parser.add_argument("--val-dataset", help="Optional normalized validation JSONL for MIPROv2.")
     parser.add_argument("--out", default="output/baselines/dspy_mipro")
@@ -41,10 +44,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--lm-kwargs", default="{}", help="Additional JSON kwargs passed to dspy.LM.")
-    parser.add_argument("--limit", type=int, help="Limit evaluation rows.")
-    parser.add_argument("--train-limit", type=int)
-    parser.add_argument("--val-limit", type=int)
+    parser.add_argument("--test-n", type=int, help="Number of leakage-free test examples to evaluate.")
+    parser.add_argument("--train-n", type=int, help="Number of leakage-free training examples for MIPROv2.")
+    parser.add_argument("--val-n", type=int, help="Number of leakage-free validation examples for MIPROv2.")
+    parser.add_argument("--limit", type=int, help="Deprecated alias for --test-n.")
+    parser.add_argument("--train-limit", type=int, help="Deprecated alias for --train-n.")
+    parser.add_argument("--val-limit", type=int, help="Deprecated alias for --val-n.")
     parser.add_argument("--derived-val-size", type=int, default=50)
+    parser.add_argument("--selection-seed", type=int, help="Seed for deterministic split selection.")
     parser.add_argument("--auto", choices=["light", "medium", "heavy", "none"], default="light")
     parser.add_argument("--num-candidates", type=int)
     parser.add_argument("--num-trials", type=int)
@@ -70,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     install_rich_tracebacks()
     args = build_parser().parse_args()
+    test_dataset = args.test_dataset or args.eval_dataset
+    if test_dataset is None:
+        raise SystemExit("Provide --test-dataset or --eval-dataset.")
+    train_n = _coalesce_count(args.train_n, args.train_limit, "train")
+    val_n = _coalesce_count(args.val_n, args.val_limit, "val")
+    test_n = _coalesce_count(args.test_n, args.limit, "test")
+    selection_seed = args.selection_seed if args.selection_seed is not None else args.seed
+    if args.optimizer == "mipro" and args.train_dataset and val_n is None and args.val_dataset is None:
+        val_n = args.derived_val_size
     lm_kwargs = _parse_lm_kwargs(args.lm_kwargs)
     config = DSPyMIPROConfig(
         model=args.model,
@@ -99,6 +115,20 @@ def main() -> None:
         show_progress=not args.no_progress,
     )
 
+    train_pool = load_examples(Path(args.train_dataset)) if args.train_dataset else None
+    val_pool = load_examples(Path(args.val_dataset)) if args.val_dataset else None
+    test_pool = load_examples(Path(test_dataset))
+    if args.optimizer == "mipro" and train_pool is None:
+        raise SystemExit("MIPROv2 requires --train-dataset.")
+    if (
+        args.optimizer == "mipro"
+        and train_pool is not None
+        and val_pool is None
+        and val_n is not None
+        and train_n is None
+    ):
+        train_n = max(0, len(train_pool) - val_n)
+
     if not args.json:
         print_title("GAVEL DSPy Baseline", f"{args.optimizer} / {args.program}")
         print_config_table(
@@ -107,41 +137,39 @@ def main() -> None:
                 "optimizer": args.optimizer,
                 "program": args.program,
                 "model": args.model,
-                "eval_dataset": args.eval_dataset,
+                "test_dataset": test_dataset,
                 "train_dataset": args.train_dataset,
                 "val_dataset": args.val_dataset,
                 "auto": args.auto,
-                "limit": args.limit,
-                "train_limit": args.train_limit,
+                "train_n": train_n,
+                "val_n": val_n,
+                "test_n": test_n,
+                "selection_seed": selection_seed,
                 "out": args.out,
             },
         )
 
-    eval_examples = load_examples(Path(args.eval_dataset), limit=args.limit)
-    train_examples = (
-        load_examples(Path(args.train_dataset), limit=args.train_limit)
-        if args.train_dataset
-        else None
+    selection = select_three_way(
+        train_pool=train_pool,
+        validation_pool=val_pool,
+        test_pool=test_pool,
+        train_n=train_n,
+        val_n=val_n,
+        test_n=test_n,
+        seed=selection_seed,
     )
-    val_examples = (
-        load_examples(Path(args.val_dataset), limit=args.val_limit)
-        if args.val_dataset
-        else None
-    )
-
-    if args.optimizer == "mipro" and train_examples and val_examples is None:
-        train_examples, val_examples = _derive_val_split(
-            train_examples,
-            val_size=args.derived_val_size,
-            seed=args.seed,
-        )
+    if args.optimizer == "mipro" and not selection.validation:
+        raise SystemExit("MIPROv2 requires a non-empty validation set; pass --val-n or --val-dataset.")
+    if not args.json:
+        print_selection_summary(selection.manifest)
 
     try:
         result = run_dspy_baseline(
-            eval_examples,
+            selection.test,
             config=config,
-            train_examples=train_examples,
-            val_examples=val_examples,
+            train_examples=selection.train,
+            val_examples=selection.validation,
+            selection_summary=selection.manifest,
         )
     except MissingDSPyError as exc:
         raise SystemExit(str(exc)) from exc
@@ -161,19 +189,10 @@ def _parse_lm_kwargs(value: str) -> Dict[str, Any]:
     return parsed
 
 
-def _derive_val_split(
-    examples: list,
-    val_size: int,
-    seed: int,
-) -> tuple[list, Optional[list]]:
-    from pact_el.baselines.dspy_mipro import split_train_val
-
-    train_split, val_split = split_train_val(
-        examples,
-        val_size=val_size,
-        seed=seed,
-    )
-    return train_split, val_split
+def _coalesce_count(primary: Optional[int], alias: Optional[int], name: str) -> Optional[int]:
+    if primary is not None and alias is not None and primary != alias:
+        raise SystemExit(f"Use either --{name}-n or its legacy alias, not conflicting values.")
+    return primary if primary is not None else alias
 
 
 if __name__ == "__main__":

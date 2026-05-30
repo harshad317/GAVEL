@@ -141,6 +141,7 @@ def run_dspy_baseline(
     config: DSPyMIPROConfig,
     train_examples: Optional[Sequence[BenchmarkExample]] = None,
     val_examples: Optional[Sequence[BenchmarkExample]] = None,
+    selection_summary: Optional[Mapping[str, Any]] = None,
 ) -> DSPyRunResult:
     """Run a direct DSPy program or optimize it with MIPROv2, then score outputs."""
 
@@ -199,6 +200,7 @@ def run_dspy_baseline(
         "program": config.program,
         "model": config.model,
         "eval_examples": len(eval_examples),
+        "test_examples": len(eval_examples),
         "train_examples": len(dspy_train),
         "val_examples": len(dspy_val),
         "predictions_path": str(predictions_path),
@@ -209,6 +211,8 @@ def run_dspy_baseline(
             "mipro_v2": DSPY_MIPROV2_GITHUB_URL,
         },
     }
+    if selection_summary is not None:
+        summary["selection"] = dict(selection_summary)
     summary_path = config.output_dir / f"{run_name}.summary.json"
     summary["summary_path"] = str(summary_path)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
