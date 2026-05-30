@@ -122,12 +122,19 @@ def test_direct_dspy_baseline_writes_predictions_and_scores(tmp_path, monkeypatc
         program="predict",
         model="fake/model",
         output_dir=tmp_path,
+        cache=False,
+        workers=2,
     )
 
-    result = run_dspy_baseline([numeric_example()], config=config)
+    result = run_dspy_baseline(
+        [numeric_example("gsm8k:test:0"), numeric_example("gsm8k:test:1")],
+        config=config,
+    )
 
     assert result.summary["accuracy"] == 1.0
     assert result.summary["mean_score"] == 1.0
+    assert result.summary["cache"] is False
+    assert result.summary["workers"] == 2
     assert result.predictions_path.exists()
     assert result.scores_path.exists()
     assert result.program_path and result.program_path.exists()
@@ -143,6 +150,7 @@ def test_mipro_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):
         auto="light",
         seed=123,
         minibatch_size=2,
+        workers=16,
     )
     train = [numeric_example("gsm8k:train:0"), numeric_example("gsm8k:train:1")]
     val = [numeric_example("gsm8k:validation:0")]
@@ -158,6 +166,7 @@ def test_mipro_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):
     assert mipro.kwargs["metric"]
     assert mipro.kwargs["auto"] == "light"
     assert mipro.kwargs["seed"] == 123
+    assert mipro.kwargs["num_threads"] == 16
     assert len(mipro.compile_kwargs["trainset"]) == 2
     assert len(mipro.compile_kwargs["valset"]) == 1
     assert mipro.compile_kwargs["minibatch_size"] == 2

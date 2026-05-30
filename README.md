@@ -66,7 +66,8 @@ Score predictions against a normalized file:
 ```bash
 python3 experiments/score_benchmark.py \
   --dataset data/benchmarks/gsm8k-test.jsonl \
-  --predictions output/predictions/gsm8k.jsonl
+  --predictions output/predictions/gsm8k.jsonl \
+  --workers 16
 ```
 
 Prediction rows should include `example_id` and `prediction`:
@@ -104,6 +105,8 @@ python3 experiments/run_dspy_mipro.py \
   --program cot \
   --model openai/gpt-4o-mini \
   --eval-dataset data/benchmarks/gsm8k-test.jsonl \
+  --workers 16 \
+  --cache True \
   --out output/baselines/gsm8k_dspy
 ```
 
@@ -123,6 +126,8 @@ python3 experiments/run_dspy_mipro.py \
   --train-n 50 \
   --val-n 50 \
   --test-n 500 \
+  --workers 16 \
+  --cache True \
   --auto light \
   --out output/baselines/gsm8k_mipro
 ```
@@ -130,6 +135,10 @@ python3 experiments/run_dspy_mipro.py \
 `--train-n`, `--val-n`, and `--test-n` select deterministic, leakage-checked
 subsets. The runner rejects overlaps by `example_id` and by normalized prompt
 fingerprint before calling DSPy/MIPROv2.
+
+`--workers` controls concurrent final evaluation. For MIPROv2 it is also used
+as `num_threads` unless `--num-threads` is passed. `--cache True` and
+`--cache False` explicitly control DSPy's LM cache.
 
 The runner follows the official DSPy GitHub API: `dspy.LM`,
 `dspy.configure`, `dspy.Predict` / `dspy.ChainOfThought`, and

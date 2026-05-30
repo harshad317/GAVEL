@@ -10,9 +10,10 @@ from __future__ import annotations
 import importlib
 import json
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tqdm.auto import tqdm
 
@@ -65,10 +66,13 @@ class DSPyMIPROConfig:
     save_program: bool = True
     prediction_field: str = "answer"
     show_progress: bool = True
+    workers: int = 1
 
     def validate(self) -> None:
         if self.optimizer not in {"dspy", "mipro"}:
             raise ValueError("optimizer must be either 'dspy' or 'mipro'")
+        if self.workers < 1:
+            raise ValueError("workers must be at least 1")
         if self.program not in {"predict", "cot", "chain_of_thought"}:
             raise ValueError("program must be 'predict', 'cot', or 'chain_of_thought'")
         if self.auto not in {None, "light", "medium", "heavy"}:
@@ -177,6 +181,7 @@ def run_dspy_baseline(
         allow_code_execution=config.allow_code_execution,
         prediction_field=config.prediction_field,
         show_progress=config.show_progress,
+        workers=config.workers,
     )
 
     run_name = _run_name(config)
@@ -204,6 +209,9 @@ def run_dspy_baseline(
         "test_examples": len(eval_examples),
         "train_examples": len(dspy_train),
         "val_examples": len(dspy_val),
+        "workers": config.workers,
+        "cache": config.cache,
+        "num_threads": _effective_num_threads(config),
         "predictions_path": str(predictions_path),
         "scores_path": str(scores_path),
         "program_path": str(program_path) if program_path else None,
@@ -276,7 +284,7 @@ def compile_mipro(
     mipro_kwargs: Dict[str, Any] = {
         "metric": metric,
         "auto": config.auto,
-        "num_threads": config.num_threads,
+        "num_threads": _effective_num_threads(config),
         "max_bootstrapped_demos": config.max_bootstrapped_demos,
         "max_labeled_demos": config.max_labeled_demos,
         "seed": config.seed,
@@ -309,9 +317,12 @@ def evaluate_program(
     allow_code_execution: bool = False,
     prediction_field: str = "answer",
     show_progress: bool = False,
+    workers: int = 1,
 ) -> tuple[List[Dict[str, Any]], List[ScoreResult]]:
-    predictions: List[Dict[str, Any]] = []
-    scores: List[ScoreResult] = []
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    predictions: List[Optional[Dict[str, Any]]] = [None] * len(examples)
+    scores: List[Optional[ScoreResult]] = [None] * len(examples)
     progress = tqdm(
         total=len(examples),
         desc="DSPy eval",
@@ -322,27 +333,94 @@ def evaluate_program(
     )
     tracker = ScoreAccumulator()
     with progress:
-        for example in examples:
-            raw_prediction = program(question=example.prompt)
-            prediction = _prediction_text(raw_prediction, field=prediction_field)
-            score = score_prediction(
-                example,
-                prediction,
-                allow_code_execution=allow_code_execution,
-            )
-            predictions.append(
-                {
-                    "example_id": example.example_id,
-                    "benchmark_id": example.benchmark_id,
-                    "prediction": prediction,
-                    "raw_prediction": _json_safe_prediction(raw_prediction),
-                }
-            )
-            scores.append(score)
-            if tracker.add(score):
-                progress.set_postfix(**tracker.progress_postfix(), refresh=False)
-            progress.update(1)
-    return predictions, scores
+        if workers == 1:
+            for index, example in enumerate(examples):
+                row, score = _evaluate_one_program(
+                    index,
+                    program,
+                    example,
+                    allow_code_execution=allow_code_execution,
+                    prediction_field=prediction_field,
+                )
+                _record_evaluation_result(
+                    index,
+                    row,
+                    score,
+                    predictions,
+                    scores,
+                    tracker,
+                    progress,
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(
+                        _evaluate_one_program,
+                        index,
+                        program,
+                        example,
+                        allow_code_execution=allow_code_execution,
+                        prediction_field=prediction_field,
+                    )
+                    for index, example in enumerate(examples)
+                ]
+                for future in as_completed(futures):
+                    index, row, score = future.result()
+                    _record_evaluation_result(
+                        index,
+                        row,
+                        score,
+                        predictions,
+                        scores,
+                        tracker,
+                        progress,
+                    )
+    return (
+        [prediction for prediction in predictions if prediction is not None],
+        [score for score in scores if score is not None],
+    )
+
+
+def _evaluate_one_program(
+    index: int,
+    program: Any,
+    example: BenchmarkExample,
+    allow_code_execution: bool,
+    prediction_field: str,
+) -> Tuple[int, Dict[str, Any], ScoreResult]:
+    raw_prediction = program(question=example.prompt)
+    prediction = _prediction_text(raw_prediction, field=prediction_field)
+    score = score_prediction(
+        example,
+        prediction,
+        allow_code_execution=allow_code_execution,
+    )
+    return (
+        index,
+        {
+            "example_id": example.example_id,
+            "benchmark_id": example.benchmark_id,
+            "prediction": prediction,
+            "raw_prediction": _json_safe_prediction(raw_prediction),
+        },
+        score,
+    )
+
+
+def _record_evaluation_result(
+    index: int,
+    prediction: Dict[str, Any],
+    score: ScoreResult,
+    predictions: List[Optional[Dict[str, Any]]],
+    scores: List[Optional[ScoreResult]],
+    tracker: ScoreAccumulator,
+    progress: Any,
+) -> None:
+    predictions[index] = prediction
+    scores[index] = score
+    if tracker.add(score):
+        progress.set_postfix(**tracker.progress_postfix(), refresh=False)
+    progress.update(1)
 
 
 def _to_dspy_example(dspy: Any, example: BenchmarkExample) -> Any:
@@ -399,6 +477,12 @@ def _json_safe_prediction(prediction: Any) -> Any:
             if not key.startswith("_")
         }
     return str(prediction)
+
+
+def _effective_num_threads(config: DSPyMIPROConfig) -> Optional[int]:
+    if config.optimizer != "mipro":
+        return config.num_threads
+    return config.num_threads if config.num_threads is not None else config.workers
 
 
 def _run_name(config: DSPyMIPROConfig) -> str:

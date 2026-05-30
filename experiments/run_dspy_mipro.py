@@ -42,7 +42,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-type", default="chat")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--max-tokens", type=int)
-    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument(
+        "--workers",
+        type=_parse_workers,
+        default=1,
+        help="Concurrent workers for final evaluation; also used as MIPRO num_threads unless overridden.",
+    )
+    parser.add_argument(
+        "--cache",
+        type=_parse_bool,
+        nargs="?",
+        const=True,
+        default=None,
+        help="Enable or disable DSPy LM caching. Use --cache True or --cache False.",
+    )
+    parser.add_argument("--no-cache", action="store_true", help="Legacy alias for --cache False.")
     parser.add_argument("--lm-kwargs", default="{}", help="Additional JSON kwargs passed to dspy.LM.")
     parser.add_argument("--test-n", type=int, help="Number of leakage-free test examples to evaluate.")
     parser.add_argument("--train-n", type=int, help="Number of leakage-free training examples for MIPROv2.")
@@ -55,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto", choices=["light", "medium", "heavy", "none"], default="light")
     parser.add_argument("--num-candidates", type=int)
     parser.add_argument("--num-trials", type=int)
-    parser.add_argument("--num-threads", type=int)
+    parser.add_argument("--num-threads", type=int, help="Override MIPROv2 compile threads.")
     parser.add_argument("--max-bootstrapped-demos", type=int, default=4)
     parser.add_argument("--max-labeled-demos", type=int, default=4)
     parser.add_argument("--metric-threshold", type=float)
@@ -86,6 +100,7 @@ def main() -> None:
     selection_seed = args.selection_seed if args.selection_seed is not None else args.seed
     if args.optimizer == "mipro" and args.train_dataset and val_n is None and args.val_dataset is None:
         val_n = args.derived_val_size
+    cache = _resolve_cache(args.cache, args.no_cache)
     lm_kwargs = _parse_lm_kwargs(args.lm_kwargs)
     config = DSPyMIPROConfig(
         model=args.model,
@@ -97,7 +112,7 @@ def main() -> None:
         model_type=args.model_type,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
-        cache=not args.no_cache,
+        cache=cache,
         lm_kwargs=lm_kwargs,
         auto=None if args.auto == "none" else args.auto,
         num_candidates=args.num_candidates,
@@ -113,6 +128,7 @@ def main() -> None:
         allow_code_execution=args.allow_code_execution,
         save_program=not args.no_save_program,
         show_progress=not args.no_progress,
+        workers=args.workers,
     )
 
     train_pool = load_examples(Path(args.train_dataset)) if args.train_dataset else None
@@ -141,6 +157,13 @@ def main() -> None:
                 "train_dataset": args.train_dataset,
                 "val_dataset": args.val_dataset,
                 "auto": args.auto,
+                "workers": args.workers,
+                "cache": cache,
+                "num_threads": (
+                    args.num_threads
+                    if args.num_threads is not None
+                    else args.workers if args.optimizer == "mipro" else None
+                ),
                 "train_n": train_n,
                 "val_n": val_n,
                 "test_n": test_n,
@@ -187,6 +210,33 @@ def _parse_lm_kwargs(value: str) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise SystemExit("--lm-kwargs must decode to a JSON object")
     return parsed
+
+
+def _parse_bool(value: str) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("expected True or False")
+
+
+def _parse_workers(value: str) -> int:
+    try:
+        workers = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--workers must be an integer") from exc
+    if workers < 1:
+        raise argparse.ArgumentTypeError("--workers must be at least 1")
+    return workers
+
+
+def _resolve_cache(cache: Optional[bool], no_cache: bool) -> bool:
+    if cache is not None and no_cache and cache:
+        raise SystemExit("Use either --cache True or --no-cache, not both.")
+    if no_cache:
+        return False
+    return True if cache is None else cache
 
 
 def _coalesce_count(primary: Optional[int], alias: Optional[int], name: str) -> Optional[int]:

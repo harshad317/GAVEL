@@ -13,6 +13,7 @@ from pact_el.benchmarks.scoring import (
     ScoreAccumulator,
     format_accuracy,
     score_prediction,
+    score_predictions,
     summarize_scores,
 )
 from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind
@@ -159,6 +160,38 @@ def test_score_accumulator_gives_every_method_the_same_accuracy_postfix():
         "scored": 2,
     }
     assert format_accuracy(tracker.accuracy, precision=2) == "50.00%"
+
+
+def test_score_predictions_can_use_process_workers():
+    examples = [
+        BenchmarkExample(
+            benchmark_id="gsm8k",
+            example_id="n0",
+            split="test",
+            prompt="",
+            expected_answer="1200",
+            metric=MetricKind.NUMERIC_EXACT,
+            source_url="official",
+        ),
+        BenchmarkExample(
+            benchmark_id="gsm8k",
+            example_id="n1",
+            split="test",
+            prompt="",
+            expected_answer="7",
+            metric=MetricKind.NUMERIC_EXACT,
+            source_url="official",
+        ),
+    ]
+
+    results = score_predictions(
+        examples,
+        {"n0": "Answer: 1,200", "n1": "Answer: 8"},
+        workers=2,
+    )
+
+    assert [result.example_id for result in results] == ["n0", "n1"]
+    assert summarize_scores(results)["accuracy"] == 0.5
 
 
 def test_mbpp_scoring_requires_explicit_code_execution():

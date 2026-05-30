@@ -8,9 +8,10 @@ import re
 import subprocess
 import tempfile
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from tqdm.auto import tqdm
 
@@ -70,6 +71,12 @@ def format_accuracy(value: Optional[float], precision: int = 1) -> str:
     return "n/a" if value is None else f"{value:.{precision}%}"
 
 
+def _validate_workers(workers: int) -> int:
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    return workers
+
+
 def score_prediction(
     example: BenchmarkExample,
     prediction: Any,
@@ -111,8 +118,10 @@ def score_predictions(
     allow_code_execution: bool = False,
     show_progress: bool = False,
     description: str = "Scoring",
+    workers: int = 1,
 ) -> List[ScoreResult]:
-    results: List[ScoreResult] = []
+    workers = _validate_workers(workers)
+    results: List[Optional[ScoreResult]] = [None] * len(examples)
     progress = tqdm(
         total=len(examples),
         desc=description,
@@ -123,18 +132,30 @@ def score_predictions(
     )
     tracker = ScoreAccumulator()
     with progress:
-        for example in examples:
-            prediction = predictions.get(example.example_id)
-            result = score_prediction(
-                example,
-                prediction,
-                allow_code_execution=allow_code_execution,
-            )
-            results.append(result)
-            if tracker.add(result):
-                progress.set_postfix(**tracker.progress_postfix(), refresh=False)
-            progress.update(1)
-    return results
+        if workers == 1:
+            for index, example in enumerate(examples):
+                result = score_prediction(
+                    example,
+                    predictions.get(example.example_id),
+                    allow_code_execution=allow_code_execution,
+                )
+                _record_score_result(index, result, results, tracker, progress)
+        else:
+            tasks = [
+                (
+                    index,
+                    example,
+                    predictions.get(example.example_id),
+                    allow_code_execution,
+                )
+                for index, example in enumerate(examples)
+            ]
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_score_prediction_task, task) for task in tasks]
+                for future in as_completed(futures):
+                    index, result = future.result()
+                    _record_score_result(index, result, results, tracker, progress)
+    return [result for result in results if result is not None]
 
 
 def summarize_scores(results: Sequence[ScoreResult]) -> Dict[str, Any]:
@@ -142,6 +163,30 @@ def summarize_scores(results: Sequence[ScoreResult]) -> Dict[str, Any]:
     for result in results:
         tracker.add(result)
     return tracker.summary()
+
+
+def _record_score_result(
+    index: int,
+    result: ScoreResult,
+    results: List[Optional[ScoreResult]],
+    tracker: ScoreAccumulator,
+    progress: Any,
+) -> None:
+    results[index] = result
+    if tracker.add(result):
+        progress.set_postfix(**tracker.progress_postfix(), refresh=False)
+    progress.update(1)
+
+
+def _score_prediction_task(
+    task: Tuple[int, BenchmarkExample, Any, bool],
+) -> Tuple[int, ScoreResult]:
+    index, example, prediction, allow_code_execution = task
+    return index, score_prediction(
+        example,
+        prediction,
+        allow_code_execution=allow_code_execution,
+    )
 
 
 def load_normalized_examples(path: Path) -> List[BenchmarkExample]:
