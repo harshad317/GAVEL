@@ -26,6 +26,12 @@ For LiteLLM-backed optimizer or target clients:
 python -m pip install -e ".[litellm,dev]"
 ```
 
+For DSPy and MIPROv2 benchmark baselines, use Python 3.10+ and install:
+
+```bash
+python -m pip install -e ".[baselines,dev]"
+```
+
 ## Minimal Example
 
 Run the deterministic replay example:
@@ -83,6 +89,43 @@ Source policy:
 - MBPP pass@1 requires executing generated code. Local scoring refuses to execute code unless `--allow-code-execution` is passed.
 - HotpotQA, MMLU, LiveBench Math, and MMLU-Pro use official Hugging Face dataset mirrors for row paging where the canonical repo points to large archives or where the official codebase itself loads from Hugging Face.
 
+### DSPy and MIPROv2 Baselines
+
+Run a direct DSPy program over a normalized benchmark:
+
+```bash
+python3 experiments/run_dspy_mipro.py \
+  --optimizer dspy \
+  --program cot \
+  --model openai/gpt-4o-mini \
+  --eval-dataset data/benchmarks/gsm8k-test.jsonl \
+  --out output/baselines/gsm8k_dspy
+```
+
+Run DSPy's MIPROv2 optimizer, using an official training split and then evaluating
+on the held-out split:
+
+```bash
+python3 experiments/prepare_benchmarks.py gsm8k --split train --out data/benchmarks
+python3 experiments/prepare_benchmarks.py gsm8k --split test --out data/benchmarks
+
+python3 experiments/run_dspy_mipro.py \
+  --optimizer mipro \
+  --program cot \
+  --model openai/gpt-4o-mini \
+  --train-dataset data/benchmarks/gsm8k-train.jsonl \
+  --eval-dataset data/benchmarks/gsm8k-test.jsonl \
+  --auto light \
+  --out output/baselines/gsm8k_mipro
+```
+
+The runner follows the official DSPy GitHub API: `dspy.LM`,
+`dspy.configure`, `dspy.Predict` / `dspy.ChainOfThought`, and
+`dspy.MIPROv2.compile(...)`. MIPROv2 requires DSPy's `optuna` extra, included
+by this package's `baselines` extra. The runner writes prediction JSONL, score
+JSONL, a summary JSON, and the saved DSPy program when the compiled program
+supports `save(...)`.
+
 ## Architecture
 
 - `pact_el.schemas`: strict Pydantic models for ledgers, graph nodes, patches, canaries, calls, and reports.
@@ -96,9 +139,11 @@ Source policy:
 - `pact_el.falsification`: acceptance, rollback, token-delta, regression, and no-patch logic.
 - `pact_el.optimize`: end-to-end PACT-EL orchestration.
 - `pact_el.benchmarks`: official-source benchmark registry, preparation adapters, and local scoring utilities.
+- `pact_el.baselines`: optional DSPy and MIPROv2 runners for normalized benchmarks.
 - `experiments/run.py`: cached matched-budget experiment runner with ablation toggles.
 - `experiments/prepare_benchmarks.py`: download and normalize official benchmarks.
 - `experiments/score_benchmark.py`: score JSON/JSONL predictions against normalized examples.
+- `experiments/run_dspy_mipro.py`: run direct DSPy and DSPy MIPROv2 baselines.
 
 ## Design Invariants
 

@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import sys
+from types import SimpleNamespace
+
+from pact_el.baselines.dspy_mipro import (
+    DSPyMIPROConfig,
+    build_dspy_metric,
+    run_dspy_baseline,
+)
+from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind
+
+
+class FakeDSPyExample:
+    def __init__(self, **kwargs):
+        self._store = dict(kwargs)
+        self.input_keys = ()
+
+    def with_inputs(self, *keys):
+        self.input_keys = keys
+        return self
+
+    def __getattr__(self, key):
+        try:
+            return self._store[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def __getitem__(self, key):
+        return self._store[key]
+
+
+class FakeProgram:
+    def __init__(self, signature):
+        self.signature = signature
+        self.saved_path = None
+
+    def __call__(self, **kwargs):
+        question = kwargs["question"]
+        if "2+2" in question:
+            return SimpleNamespace(answer="4")
+        return SimpleNamespace(answer="A")
+
+    def save(self, path):
+        self.saved_path = path
+        with open(path, "w") as handle:
+            handle.write('{"fake": true}')
+
+
+class FakeMIPROv2:
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.compile_kwargs = None
+        FakeMIPROv2.instances.append(self)
+
+    def compile(self, program, **kwargs):
+        self.compile_kwargs = kwargs
+        return program
+
+
+class FakeLM:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+def fake_dspy_module():
+    return SimpleNamespace(
+        Example=FakeDSPyExample,
+        Predict=FakeProgram,
+        ChainOfThought=FakeProgram,
+        MIPROv2=FakeMIPROv2,
+        LM=FakeLM,
+        configured=None,
+        configure=lambda **kwargs: setattr(fake_dspy_module.module, "configured", kwargs),
+    )
+
+
+fake_dspy_module.module = None
+
+
+def install_fake_dspy(monkeypatch):
+    module = fake_dspy_module()
+    fake_dspy_module.module = module
+    FakeMIPROv2.instances = []
+    monkeypatch.setitem(sys.modules, "dspy", module)
+    return module
+
+
+def numeric_example(example_id="gsm8k:test:0"):
+    return BenchmarkExample(
+        benchmark_id="gsm8k",
+        example_id=example_id,
+        split="test",
+        prompt="What is 2+2?",
+        expected_answer="4",
+        metric=MetricKind.NUMERIC_EXACT,
+        source_url="official",
+    )
+
+
+def test_dspy_metric_delegates_to_normalized_scorer():
+    example = numeric_example()
+    dspy_example = FakeDSPyExample(
+        question=example.prompt,
+        answer=example.expected_answer,
+        benchmark_example=example.model_dump(mode="json"),
+    ).with_inputs("question")
+
+    metric = build_dspy_metric()
+
+    assert metric(dspy_example, SimpleNamespace(answer="Answer: 4")) == 1.0
+    assert metric(dspy_example, SimpleNamespace(answer="Answer: 5")) == 0.0
+
+
+def test_direct_dspy_baseline_writes_predictions_and_scores(tmp_path, monkeypatch):
+    install_fake_dspy(monkeypatch)
+    config = DSPyMIPROConfig(
+        optimizer="dspy",
+        program="predict",
+        model="fake/model",
+        output_dir=tmp_path,
+    )
+
+    result = run_dspy_baseline([numeric_example()], config=config)
+
+    assert result.summary["mean_score"] == 1.0
+    assert result.predictions_path.exists()
+    assert result.scores_path.exists()
+    assert result.program_path and result.program_path.exists()
+
+
+def test_mipro_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):
+    install_fake_dspy(monkeypatch)
+    config = DSPyMIPROConfig(
+        optimizer="mipro",
+        program="cot",
+        model="fake/model",
+        output_dir=tmp_path,
+        auto="light",
+        seed=123,
+        minibatch_size=2,
+    )
+    train = [numeric_example("gsm8k:train:0"), numeric_example("gsm8k:train:1")]
+    val = [numeric_example("gsm8k:validation:0")]
+
+    result = run_dspy_baseline(
+        [numeric_example()],
+        config=config,
+        train_examples=train,
+        val_examples=val,
+    )
+
+    [mipro] = FakeMIPROv2.instances
+    assert mipro.kwargs["metric"]
+    assert mipro.kwargs["auto"] == "light"
+    assert mipro.kwargs["seed"] == 123
+    assert len(mipro.compile_kwargs["trainset"]) == 2
+    assert len(mipro.compile_kwargs["valset"]) == 1
+    assert mipro.compile_kwargs["minibatch_size"] == 2
+    assert result.summary["optimizer"] == "mipro"
