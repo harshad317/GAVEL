@@ -52,7 +52,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"))
     parser.add_argument("--api-base", default=os.getenv("OPENAI_API_BASE"))
     parser.add_argument("--model-type", default="chat")
-    parser.add_argument("--temperature", type=float)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        help=(
+            "Sampling temperature for the task LM, between 0 and 2. "
+            "If omitted, DSPy/provider default is used."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument(
         "--workers",
@@ -91,7 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minibatch-size", type=int, default=35)
     parser.add_argument("--minibatch-full-eval-steps", type=int, default=5)
     parser.add_argument("--reflection-model", help="GEPA reflection LM. Defaults to --model.")
-    parser.add_argument("--reflection-temperature", type=float)
+    parser.add_argument(
+        "--reflection-temperature",
+        type=float,
+        help="GEPA reflection LM temperature. Defaults to --temperature, then provider default.",
+    )
     parser.add_argument("--reflection-max-tokens", type=int)
     parser.add_argument("--reflection-minibatch-size", type=int, default=3)
     parser.add_argument("--seed", type=int, default=9)
@@ -203,6 +214,7 @@ def main() -> None:
                 "val_dataset": dataset_info.get("val_dataset") or args.val_dataset,
                 "benchmark_out": args.benchmark_out if args.benchmark else None,
                 "auto": args.auto,
+                "temperature": args.temperature if args.temperature is not None else "provider_default",
                 "workers": args.workers,
                 "cache": cache,
                 "num_threads": (
@@ -212,6 +224,9 @@ def main() -> None:
                 ),
                 "reflection_model": (
                     (args.reflection_model or args.model) if args.optimizer == "gepa" else None
+                ),
+                "reflection_temperature": (
+                    _effective_reflection_temperature(args) if args.optimizer == "gepa" else None
                 ),
                 "max_metric_calls": args.max_metric_calls,
                 "max_full_evals": args.max_full_evals,
@@ -370,6 +385,14 @@ def _resolve_cache(cache: Optional[bool], no_cache: bool) -> bool:
     if no_cache:
         return False
     return True if cache is None else cache
+
+
+def _effective_reflection_temperature(args: argparse.Namespace) -> str | float:
+    if args.reflection_temperature is not None:
+        return args.reflection_temperature
+    if args.temperature is not None:
+        return args.temperature
+    return "provider_default"
 
 
 def _coalesce_count(primary: Optional[int], alias: Optional[int], name: str) -> Optional[int]:

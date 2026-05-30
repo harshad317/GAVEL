@@ -118,6 +118,7 @@ python3 experiments/run_dspy_mipro.py \
   --program cot \
   --model openai/gpt-4o-mini \
   --eval-dataset data/benchmarks/gsm8k-test.jsonl \
+  --temperature 0.0 \
   --workers 16 \
   --cache True \
   --out output/baselines/gsm8k_dspy
@@ -139,6 +140,7 @@ python3 experiments/run_dspy_mipro.py \
   --train-n 50 \
   --val-n 50 \
   --test-n 500 \
+  --temperature 0.0 \
   --workers 16 \
   --cache True \
   --auto light \
@@ -156,6 +158,7 @@ python3 experiments/run_dspy_mipro.py \
   --train-n 50 \
   --val-n 50 \
   --test-n 200 \
+  --temperature 0.0 \
   --workers 16 \
   --cache True \
   --auto heavy \
@@ -164,6 +167,9 @@ python3 experiments/run_dspy_mipro.py \
 
 GEPA uses `--model` as the reflection LM by default. To use a stronger
 reflection model without changing the task model, pass `--reflection-model`.
+Use `--temperature` to set the task LM temperature. GEPA also accepts
+`--reflection-temperature`; if it is omitted, GEPA uses `--temperature` for the
+reflection LM, then the provider default if neither flag is set.
 
 `--train-n`, `--val-n`, and `--test-n` select deterministic, leakage-checked
 subsets. The runner rejects overlaps by `example_id` and by normalized prompt
@@ -193,6 +199,7 @@ python3 experiments/run_dspy_mipro.py \
   --train-n 50 \
   --val-n 50 \
   --test-n 200 \
+  --temperature 0.0 \
   --workers 16 \
   --cache True \
   --auto light \
@@ -220,6 +227,8 @@ python3 experiments/run_gavel.py \
   --train-n 50 \
   --val-n 50 \
   --test-n 200 \
+  --temperature 0.0 \
+  --optimizer-temperature 0.0 \
   --workers 16 \
   --cache True \
   --budget 9 \

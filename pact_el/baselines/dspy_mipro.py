@@ -82,6 +82,8 @@ class DSPyMIPROConfig:
     def validate(self) -> None:
         if self.optimizer not in {"dspy", "mipro", "gepa"}:
             raise ValueError("optimizer must be 'dspy', 'mipro', or 'gepa'")
+        _validate_temperature(self.temperature, "temperature")
+        _validate_temperature(self.reflection_temperature, "reflection_temperature")
         if self.workers < 1:
             raise ValueError("workers must be at least 1")
         if self.program not in {"predict", "cot", "chain_of_thought"}:
@@ -373,7 +375,17 @@ def run_dspy_baseline(
         "optimizer": config.optimizer,
         "program": config.program,
         "model": config.model,
+        "temperature": config.temperature,
+        "effective_temperature": _display_temperature(config.temperature),
         "reflection_model": _effective_reflection_model(config) if config.optimizer == "gepa" else None,
+        "reflection_temperature": (
+            config.reflection_temperature if config.optimizer == "gepa" else None
+        ),
+        "effective_reflection_temperature": (
+            _display_temperature(_effective_reflection_temperature(config))
+            if config.optimizer == "gepa"
+            else None
+        ),
         "eval_examples": len(eval_examples),
         "test_examples": len(eval_examples),
         "train_examples": len(dspy_train),
@@ -466,6 +478,17 @@ def configure_reflection_lm(dspy: Any, config: DSPyMIPROConfig) -> Any:
         cache=config.cache,
         **kwargs,
     )
+
+
+def _validate_temperature(value: Optional[float], name: str) -> None:
+    if value is None:
+        return
+    if value < 0 or value > 2:
+        raise ValueError(f"{name} must be between 0 and 2")
+
+
+def _display_temperature(value: Optional[float]) -> str | float:
+    return "provider_default" if value is None else value
 
 
 def build_program(dspy: Any, program: str) -> Any:
@@ -929,6 +952,10 @@ def _effective_num_threads(config: DSPyMIPROConfig) -> Optional[int]:
 
 def _effective_reflection_model(config: DSPyMIPROConfig) -> str:
     return config.reflection_model or config.model
+
+
+def _effective_reflection_temperature(config: DSPyMIPROConfig) -> Optional[float]:
+    return config.reflection_temperature if config.reflection_temperature is not None else config.temperature
 
 
 def _method_label(config: DSPyMIPROConfig) -> str:

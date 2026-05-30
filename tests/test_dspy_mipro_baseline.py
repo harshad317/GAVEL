@@ -4,6 +4,8 @@ import sys
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from pact_el.baselines.dspy_mipro import (
     DSPyMIPROConfig,
     _evaluate_program_with_stats,
@@ -158,12 +160,13 @@ def test_gepa_metric_returns_feedback_score():
 
 
 def test_direct_dspy_baseline_writes_predictions_and_scores(tmp_path, monkeypatch):
-    install_fake_dspy(monkeypatch)
+    module = install_fake_dspy(monkeypatch)
     config = DSPyMIPROConfig(
         optimizer="dspy",
         program="predict",
         model="fake/model",
         output_dir=tmp_path,
+        temperature=0.2,
         cache=False,
         workers=2,
     )
@@ -178,9 +181,12 @@ def test_direct_dspy_baseline_writes_predictions_and_scores(tmp_path, monkeypatc
     assert result.summary["cache"] is False
     assert result.summary["workers"] == 2
     assert result.summary["method"] == "dspy"
+    assert result.summary["temperature"] == 0.2
+    assert result.summary["effective_temperature"] == 0.2
     assert result.summary["split_results"]["test"]["score"] == 1.0
     assert result.summary["split_results"]["test"]["api_calls"] == 2
     assert result.summary["split_results"]["train"]["score"] is None
+    assert module.configured["lm"].kwargs["temperature"] == 0.2
     assert result.predictions_path.exists()
     assert result.scores_path.exists()
     assert result.program_path and result.program_path.exists()
@@ -230,6 +236,7 @@ def test_mipro_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):
     assert mipro.compile_kwargs["minibatch_size"] == 2
     assert result.summary["optimizer"] == "mipro"
     assert result.summary["method"] == "miprov2"
+    assert result.summary["effective_temperature"] == "provider_default"
     assert result.summary["split_results"]["train"]["score"] == 1.0
     assert result.summary["split_results"]["val"]["score"] == 1.0
     assert result.summary["split_results"]["test"]["score"] == 1.0
@@ -247,6 +254,8 @@ def test_gepa_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):
         seed=123,
         workers=16,
         reflection_model="fake/reflection",
+        temperature=0.1,
+        reflection_temperature=0.3,
         reflection_minibatch_size=2,
     )
     train = [numeric_example("gsm8k:train:0"), numeric_example("gsm8k:train:1")]
@@ -271,6 +280,18 @@ def test_gepa_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):
     assert result.summary["optimizer"] == "gepa"
     assert result.summary["method"] == "gepa"
     assert result.summary["reflection_model"] == "fake/reflection"
+    assert result.summary["temperature"] == 0.1
+    assert result.summary["reflection_temperature"] == 0.3
+    assert result.summary["effective_reflection_temperature"] == 0.3
+    assert gepa.kwargs["reflection_lm"].kwargs["temperature"] == 0.3
     assert result.summary["split_results"]["train"]["score"] == 1.0
     assert result.summary["split_results"]["val"]["score"] == 1.0
     assert result.summary["split_results"]["test"]["score"] == 1.0
+
+
+def test_dspy_temperature_validation():
+    with pytest.raises(ValueError, match="temperature must be between 0 and 2"):
+        DSPyMIPROConfig(temperature=-0.1).validate()
+
+    with pytest.raises(ValueError, match="reflection_temperature must be between 0 and 2"):
+        DSPyMIPROConfig(reflection_temperature=2.1).validate()

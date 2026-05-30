@@ -58,6 +58,8 @@ class GavelConfig:
     base_prompt: Optional[str] = None
 
     def validate(self) -> None:
+        _validate_temperature(self.temperature, "temperature")
+        _validate_temperature(self.optimizer_temperature, "optimizer_temperature")
         if self.workers < 1:
             raise ValueError("workers must be at least 1")
         if self.budget < 1:
@@ -189,6 +191,8 @@ async def run_gavel_baseline(
         "optimizer": "gavel",
         "model": config.model,
         "optimizer_model": _optimizer_model(config),
+        "temperature": config.temperature,
+        "optimizer_temperature": config.optimizer_temperature,
         "benchmark": benchmark_spec.benchmark_id if benchmark_spec else None,
         "eval_examples": len(test_examples),
         "test_examples": len(test_examples),
@@ -700,6 +704,11 @@ def _cached_call_record(
 
 def _optimizer_model(config: GavelConfig) -> str:
     return config.optimizer_model or config.model
+
+
+def _validate_temperature(value: float, name: str) -> None:
+    if value < 0 or value > 2:
+        raise ValueError(f"{name} must be between 0 and 2")
 
 
 def _run_name(config: GavelConfig, spec: Optional[BenchmarkSpec]) -> str:

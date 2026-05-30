@@ -47,8 +47,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--optimizer-model", default=os.getenv("GAVEL_OPTIMIZER_MODEL"))
     parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"))
     parser.add_argument("--api-base", default=os.getenv("OPENAI_API_BASE"))
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--optimizer-temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for the target benchmark LM, between 0 and 2.",
+    )
+    parser.add_argument(
+        "--optimizer-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for the GAVEL optimizer LM, between 0 and 2.",
+    )
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--optimizer-max-tokens", type=int)
     parser.add_argument("--target-kwargs", default="{}", help="Additional JSON kwargs passed to target LiteLLM calls.")
@@ -171,6 +181,8 @@ async def async_main() -> None:
                 "train_dataset": dataset_info.get("train_dataset") or args.train_dataset,
                 "val_dataset": dataset_info.get("val_dataset") or args.val_dataset,
                 "benchmark_out": args.benchmark_out if args.benchmark else None,
+                "temperature": args.temperature,
+                "optimizer_temperature": args.optimizer_temperature,
                 "workers": args.workers,
                 "cache": cache,
                 "budget": args.budget,

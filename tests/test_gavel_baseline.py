@@ -127,6 +127,8 @@ async def test_gavel_baseline_compiles_and_reports_splits(tmp_path, sample_compi
         model="fake-target",
         optimizer_model="fake-optimizer",
         output_dir=tmp_path,
+        temperature=0.2,
+        optimizer_temperature=0.3,
         cache=False,
         workers=2,
         show_progress=False,
@@ -143,6 +145,8 @@ async def test_gavel_baseline_compiles_and_reports_splits(tmp_path, sample_compi
 
     assert result.summary["optimizer"] == "gavel"
     assert result.summary["method"] == "gavel"
+    assert result.summary["temperature"] == 0.2
+    assert result.summary["optimizer_temperature"] == 0.3
     assert result.summary["accepted"] is True
     assert result.summary["split_results"]["train"]["score"] == 1.0
     assert result.summary["split_results"]["val"]["score"] == 1.0
@@ -157,6 +161,14 @@ def test_default_base_prompt_is_benchmark_specific():
     prompt = default_base_prompt(_spec())
     assert "benchmark-solving" in prompt
     assert "final answer" in prompt
+
+
+def test_gavel_temperature_validation():
+    with pytest.raises(ValueError, match="temperature must be between 0 and 2"):
+        GavelConfig(temperature=2.1).validate()
+
+    with pytest.raises(ValueError, match="optimizer_temperature must be between 0 and 2"):
+        GavelConfig(optimizer_temperature=-0.1).validate()
 
 
 @pytest.mark.asyncio
