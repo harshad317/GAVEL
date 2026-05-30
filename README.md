@@ -34,6 +34,55 @@ Run the deterministic replay example:
 python3 examples/basic.py
 ```
 
+## Benchmarks
+
+List the supported official-source benchmarks:
+
+```bash
+python3 experiments/prepare_benchmarks.py list
+```
+
+Prepare a normalized JSONL file:
+
+```bash
+python3 experiments/prepare_benchmarks.py gsm8k --out data/benchmarks
+python3 experiments/prepare_benchmarks.py mmlu_pro --limit 100 --out data/benchmarks
+python3 experiments/prepare_benchmarks.py all --limit 100 --out data/benchmarks
+```
+
+Score predictions against a normalized file:
+
+```bash
+python3 experiments/score_benchmark.py \
+  --dataset data/benchmarks/gsm8k-test.jsonl \
+  --predictions output/predictions/gsm8k.jsonl
+```
+
+Prediction rows should include `example_id` and `prediction`:
+
+```json
+{"example_id": "gsm8k:test:0", "prediction": "#### 72"}
+```
+
+Supported benchmark ids:
+
+- `gsm8k`
+- `ifbench`
+- `hotpotqa`
+- `drop`
+- `mbpp`
+- `truthfulqa`
+- `livebench_math`
+- `mmlu`
+- `mmlu_pro`
+
+Source policy:
+
+- Every registry entry points at an official benchmark website, GitHub repository, or official dataset host.
+- IFBench and TruthfulQA retain official-evaluator metadata because their headline metrics are not plain exact match.
+- MBPP pass@1 requires executing generated code. Local scoring refuses to execute code unless `--allow-code-execution` is passed.
+- HotpotQA, MMLU, LiveBench Math, and MMLU-Pro use official Hugging Face dataset mirrors for row paging where the canonical repo points to large archives or where the official codebase itself loads from Hugging Face.
+
 ## Architecture
 
 - `pact_el.schemas`: strict Pydantic models for ledgers, graph nodes, patches, canaries, calls, and reports.
@@ -46,7 +95,10 @@ python3 examples/basic.py
 - `pact_el.clients`: async target and optimizer clients, including replay clients and optional LiteLLM clients.
 - `pact_el.falsification`: acceptance, rollback, token-delta, regression, and no-patch logic.
 - `pact_el.optimize`: end-to-end PACT-EL orchestration.
+- `pact_el.benchmarks`: official-source benchmark registry, preparation adapters, and local scoring utilities.
 - `experiments/run.py`: cached matched-budget experiment runner with ablation toggles.
+- `experiments/prepare_benchmarks.py`: download and normalize official benchmarks.
+- `experiments/score_benchmark.py`: score JSON/JSONL predictions against normalized examples.
 
 ## Design Invariants
 

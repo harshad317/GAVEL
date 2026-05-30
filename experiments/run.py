@@ -11,8 +11,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pact_el.clients import ReplayOptimizerClient, ReplayTargetClient
 from pact_el.optimize import pact_optimize
@@ -137,4 +140,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
