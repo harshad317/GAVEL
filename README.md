@@ -38,6 +38,12 @@ For IFBench's official verifier, install the IFBench extra too:
 python -m pip install -e ".[baselines,ifbench,dev]"
 ```
 
+For live GAVEL benchmark runs, install LiteLLM as well:
+
+```bash
+python -m pip install -e ".[litellm,baselines,ifbench,dev]"
+```
+
 ## Minimal Example
 
 Run the deterministic replay example:
@@ -201,6 +207,30 @@ test, and optimization rows. The split scores are final post-optimization
 evaluations; the optimization row reports optimizer API calls when DSPy's LM
 history exposes that count.
 
+### GAVEL Benchmark Runner
+
+Run GAVEL with the same official benchmark and leakage-safe split flow:
+
+```bash
+python3 experiments/run_gavel.py \
+  --benchmark ifbench \
+  --model openai/gpt-4.1-mini \
+  --optimizer-model openai/gpt-4.1-mini \
+  --train-n 50 \
+  --val-n 50 \
+  --test-n 200 \
+  --workers 16 \
+  --cache True \
+  --budget 9 \
+  --out output/baselines/ifbench_gavel
+```
+
+The GAVEL runner first evaluates the base prompt on the selected train examples
+to build an Evidence Ledger, compiles one PACT-EL/GAVEL prompt, then evaluates
+that optimized prompt on train, validation, and test. It writes prediction
+JSONL, score JSONL, the full GAVEL optimization report, the rendered prompt,
+and a summary JSON.
+
 ## Architecture
 
 - `pact_el.schemas`: strict Pydantic models for ledgers, graph nodes, patches, canaries, calls, and reports.
@@ -214,11 +244,12 @@ history exposes that count.
 - `pact_el.falsification`: acceptance, rollback, token-delta, regression, and no-patch logic.
 - `pact_el.optimize`: end-to-end PACT-EL orchestration.
 - `pact_el.benchmarks`: official-source benchmark registry, preparation adapters, and local scoring utilities.
-- `pact_el.baselines`: optional DSPy, MIPROv2, and GEPA runners for normalized benchmarks.
+- `pact_el.baselines`: optional DSPy, MIPROv2, GEPA, and GAVEL runners for normalized benchmarks.
 - `experiments/run.py`: cached matched-budget experiment runner with ablation toggles.
 - `experiments/prepare_benchmarks.py`: download and normalize official benchmarks.
 - `experiments/score_benchmark.py`: score JSON/JSONL predictions against normalized examples.
 - `experiments/run_dspy_mipro.py`: run direct DSPy, DSPy MIPROv2, and DSPy GEPA baselines.
+- `experiments/run_gavel.py`: run live GAVEL optimization and benchmark evaluation.
 
 ## Design Invariants
 

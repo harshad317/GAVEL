@@ -91,12 +91,17 @@ def print_run_summary(summary: Mapping[str, Any]) -> None:
         "optimizer",
         "program",
         "model",
+        "optimizer_model",
+        "benchmark",
         "eval_examples",
         "train_examples",
         "val_examples",
         "workers",
         "cache",
+        "budget",
         "num_threads",
+        "accepted",
+        "decision",
         "accuracy",
         "mean_score",
         "passed",
@@ -105,6 +110,8 @@ def print_run_summary(summary: Mapping[str, Any]) -> None:
         "predictions_path",
         "scores_path",
         "program_path",
+        "report_path",
+        "prompt_path",
     ):
         value = summary.get(key)
         style = _score_style(value) if key in {"accuracy", "mean_score"} else "white"
