@@ -116,6 +116,26 @@ def print_run_summary(summary: Mapping[str, Any]) -> None:
     console.print(table)
 
 
+def print_method_results_table(summary: Mapping[str, Any]) -> None:
+    method = str(summary.get("method") or summary.get("optimizer") or "method")
+    split_results = summary.get("split_results") or {}
+    table = Table(box=box.ROUNDED, header_style="bold", show_lines=False)
+    table.add_column("Split", style="bold cyan")
+    table.add_column("Score", justify="right")
+    table.add_column("StdDev", justify="right")
+    table.add_column("API calls", justify="right")
+    for split_name in ("train", "val", "test", "optimization"):
+        row = split_results.get(split_name) or {}
+        table.add_row(
+            split_name,
+            _format_float(row.get("score")),
+            _format_float(row.get("stddev")),
+            _format_count(row.get("api_calls")),
+            style=_score_style(row.get("score")) if split_name != "optimization" else "dim",
+        )
+    console.print(Panel(table, title=f" {method} ", border_style="magenta", box=box.ROUNDED))
+
+
 def print_selection_summary(manifest: Mapping[str, Any]) -> None:
     table = Table(title="Leakage-Safe Split Selection", box=box.SIMPLE_HEAVY, header_style="bold green")
     table.add_column("Split", style="bold cyan")
@@ -165,3 +185,15 @@ def _count_style(value: Any) -> str:
         return "green" if int(value) == 0 else "yellow"
     except (TypeError, ValueError):
         return "dim"
+
+
+def _format_float(value: Any) -> str:
+    if value is None:
+        return "—"
+    return f"{float(value):.3f}"
+
+
+def _format_count(value: Any) -> str:
+    if value is None:
+        return "—"
+    return str(int(value))

@@ -135,6 +135,10 @@ def test_direct_dspy_baseline_writes_predictions_and_scores(tmp_path, monkeypatc
     assert result.summary["mean_score"] == 1.0
     assert result.summary["cache"] is False
     assert result.summary["workers"] == 2
+    assert result.summary["method"] == "dspy"
+    assert result.summary["split_results"]["test"]["score"] == 1.0
+    assert result.summary["split_results"]["test"]["api_calls"] == 2
+    assert result.summary["split_results"]["train"]["score"] is None
     assert result.predictions_path.exists()
     assert result.scores_path.exists()
     assert result.program_path and result.program_path.exists()
@@ -171,3 +175,8 @@ def test_mipro_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):
     assert len(mipro.compile_kwargs["valset"]) == 1
     assert mipro.compile_kwargs["minibatch_size"] == 2
     assert result.summary["optimizer"] == "mipro"
+    assert result.summary["method"] == "miprov2"
+    assert result.summary["split_results"]["train"]["score"] == 1.0
+    assert result.summary["split_results"]["val"]["score"] == 1.0
+    assert result.summary["split_results"]["test"]["score"] == 1.0
+    assert "optimization" in result.summary["split_results"]

@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import json
 import random
+import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -154,13 +155,16 @@ def run_dspy_baseline(
     dspy = import_dspy()
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    configure_lm(dspy, config)
+    lm = configure_lm(dspy, config)
     metric = build_dspy_metric(
         allow_code_execution=config.allow_code_execution,
         prediction_field=config.prediction_field,
     )
     program = build_program(dspy, config.program)
 
+    train_split: List[BenchmarkExample] = []
+    val_split: List[BenchmarkExample] = []
+    optimization_api_calls: Optional[int] = 0 if config.optimizer == "dspy" else None
     dspy_train: List[Any] = []
     dspy_val: List[Any] = []
     if config.optimizer == "mipro":
@@ -173,27 +177,40 @@ def run_dspy_baseline(
         )
         dspy_train = to_dspy_examples(dspy, train_split)
         dspy_val = to_dspy_examples(dspy, val_split)
+        before_compile_calls = _lm_history_count(lm)
         program = compile_mipro(dspy, program, dspy_train, dspy_val, metric, config)
+        after_compile_calls = _lm_history_count(lm)
+        optimization_api_calls = _count_delta(before_compile_calls, after_compile_calls)
 
-    predictions, scores = evaluate_program(
-        program,
-        eval_examples,
+    run_name = _run_name(config)
+    split_evaluations = _evaluate_report_splits(
+        program=program,
+        run_name=run_name,
+        output_dir=config.output_dir,
+        train_examples=train_split,
+        val_examples=val_split,
+        test_examples=eval_examples,
         allow_code_execution=config.allow_code_execution,
         prediction_field=config.prediction_field,
         show_progress=config.show_progress,
         workers=config.workers,
+        lm=lm,
     )
-
-    run_name = _run_name(config)
-    predictions_path = config.output_dir / f"{run_name}.predictions.jsonl"
-    scores_path = config.output_dir / f"{run_name}.scores.jsonl"
-    predictions_path.write_text(
-        "\n".join(json.dumps(row, sort_keys=True) for row in predictions)
-        + ("\n" if predictions else "")
-    )
-    scores_path.write_text(
-        "\n".join(score.model_dump_json() for score in scores) + ("\n" if scores else "")
-    )
+    test_eval = split_evaluations["test"]
+    predictions_path = Path(test_eval["predictions_path"])
+    scores_path = Path(test_eval["scores_path"])
+    scores = test_eval["scores"]
+    split_results = {
+        split_name: split_eval["summary"]
+        for split_name, split_eval in split_evaluations.items()
+    }
+    split_results["optimization"] = {
+        "score": None,
+        "stddev": None,
+        "api_calls": optimization_api_calls,
+        "examples": 0,
+        "scored": 0,
+    }
 
     program_path: Optional[Path] = None
     if config.save_program and hasattr(program, "save"):
@@ -202,6 +219,7 @@ def run_dspy_baseline(
 
     summary = {
         **summarize_scores(scores),
+        "method": _method_label(config),
         "optimizer": config.optimizer,
         "program": config.program,
         "model": config.model,
@@ -215,6 +233,14 @@ def run_dspy_baseline(
         "predictions_path": str(predictions_path),
         "scores_path": str(scores_path),
         "program_path": str(program_path) if program_path else None,
+        "split_results": split_results,
+        "split_paths": {
+            split_name: {
+                "predictions_path": split_eval["predictions_path"],
+                "scores_path": split_eval["scores_path"],
+            }
+            for split_name, split_eval in split_evaluations.items()
+        },
         "official_sources": {
             "dspy": DSPY_GITHUB_URL,
             "mipro_v2": DSPY_MIPROV2_GITHUB_URL,
@@ -311,6 +337,105 @@ def to_dspy_examples(dspy: Any, examples: Sequence[BenchmarkExample]) -> List[An
     return [_to_dspy_example(dspy, example) for example in examples]
 
 
+def _evaluate_report_splits(
+    *,
+    program: Any,
+    run_name: str,
+    output_dir: Path,
+    train_examples: Sequence[BenchmarkExample],
+    val_examples: Sequence[BenchmarkExample],
+    test_examples: Sequence[BenchmarkExample],
+    allow_code_execution: bool,
+    prediction_field: str,
+    show_progress: bool,
+    workers: int,
+    lm: Any,
+) -> Dict[str, Dict[str, Any]]:
+    split_examples = {
+        "train": list(train_examples),
+        "val": list(val_examples),
+        "test": list(test_examples),
+    }
+    evaluations: Dict[str, Dict[str, Any]] = {}
+    for split_name, examples in split_examples.items():
+        before_calls = _lm_history_count(lm)
+        predictions, scores = evaluate_program(
+            program,
+            examples,
+            allow_code_execution=allow_code_execution,
+            prediction_field=prediction_field,
+            show_progress=show_progress and bool(examples),
+            workers=workers,
+            description=f"DSPy {split_name}",
+        )
+        after_calls = _lm_history_count(lm)
+        api_calls = _count_delta(before_calls, after_calls)
+        api_calls = max(api_calls or 0, len(examples))
+        predictions_path, scores_path = _write_split_outputs(
+            output_dir,
+            run_name,
+            split_name,
+            predictions,
+            scores,
+        )
+        evaluations[split_name] = {
+            "predictions": predictions,
+            "scores": scores,
+            "predictions_path": str(predictions_path),
+            "scores_path": str(scores_path),
+            "summary": _split_result_summary(scores, examples=len(examples), api_calls=api_calls),
+        }
+    return evaluations
+
+
+def _write_split_outputs(
+    output_dir: Path,
+    run_name: str,
+    split_name: str,
+    predictions: Sequence[Mapping[str, Any]],
+    scores: Sequence[ScoreResult],
+) -> tuple[Path, Path]:
+    stem = run_name if split_name == "test" else f"{run_name}.{split_name}"
+    predictions_path = output_dir / f"{stem}.predictions.jsonl"
+    scores_path = output_dir / f"{stem}.scores.jsonl"
+    predictions_path.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in predictions)
+        + ("\n" if predictions else "")
+    )
+    scores_path.write_text(
+        "\n".join(score.model_dump_json() for score in scores) + ("\n" if scores else "")
+    )
+    return predictions_path, scores_path
+
+
+def _split_result_summary(
+    scores: Sequence[ScoreResult],
+    *,
+    examples: int,
+    api_calls: Optional[int],
+) -> Dict[str, Any]:
+    score_values = [float(score.score) for score in scores if score.score is not None]
+    summary = summarize_scores(scores)
+    return {
+        "score": summary["mean_score"],
+        "accuracy": summary["accuracy"],
+        "stddev": _sample_stddev(score_values),
+        "api_calls": api_calls,
+        "examples": examples,
+        "scored": summary["scored"],
+        "passed": summary["passed"],
+        "unscored": summary["unscored"],
+    }
+
+
+def _sample_stddev(values: Sequence[float]) -> Optional[float]:
+    if not values:
+        return None
+    if len(values) == 1:
+        return 0.0
+    return statistics.stdev(values)
+
+
 def evaluate_program(
     program: Any,
     examples: Sequence[BenchmarkExample],
@@ -318,6 +443,7 @@ def evaluate_program(
     prediction_field: str = "answer",
     show_progress: bool = False,
     workers: int = 1,
+    description: str = "DSPy eval",
 ) -> tuple[List[Dict[str, Any]], List[ScoreResult]]:
     if workers < 1:
         raise ValueError("workers must be at least 1")
@@ -325,7 +451,7 @@ def evaluate_program(
     scores: List[Optional[ScoreResult]] = [None] * len(examples)
     progress = tqdm(
         total=len(examples),
-        desc="DSPy eval",
+        desc=description,
         unit="ex",
         colour="magenta",
         dynamic_ncols=True,
@@ -479,10 +605,53 @@ def _json_safe_prediction(prediction: Any) -> Any:
     return str(prediction)
 
 
+def _lm_history_count(lm: Any) -> Optional[int]:
+    if lm is None:
+        return None
+    for attr in ("history", "_history", "request_history"):
+        history = getattr(lm, attr, None)
+        length = _safe_len(history)
+        if length is not None:
+            return length
+    for method_name in ("get_history", "inspect_history"):
+        method = getattr(lm, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            history = method()
+        except TypeError:
+            continue
+        length = _safe_len(history)
+        if length is not None:
+            return length
+    return None
+
+
+def _safe_len(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, (str, bytes, Mapping)):
+        return None
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def _count_delta(before: Optional[int], after: Optional[int]) -> Optional[int]:
+    if before is None or after is None:
+        return None
+    return max(0, after - before)
+
+
 def _effective_num_threads(config: DSPyMIPROConfig) -> Optional[int]:
     if config.optimizer != "mipro":
         return config.num_threads
     return config.num_threads if config.num_threads is not None else config.workers
+
+
+def _method_label(config: DSPyMIPROConfig) -> str:
+    if config.optimizer == "mipro":
+        return "miprov2"
+    return config.optimizer
 
 
 def _run_name(config: DSPyMIPROConfig) -> str:

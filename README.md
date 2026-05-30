@@ -175,6 +175,11 @@ The current IFBench registry entry has one public official test split, so this
 command derives disjoint train, validation, and test subsets from that pool and
 records the split manifest in the summary JSON.
 
+After each run, the CLI prints a method results table with train, validation,
+test, and optimization rows. The split scores are final post-optimization
+evaluations; the optimization row reports optimizer API calls when DSPy's LM
+history exposes that count.
+
 ## Architecture
 
 - `pact_el.schemas`: strict Pydantic models for ledgers, graph nodes, patches, canaries, calls, and reports.

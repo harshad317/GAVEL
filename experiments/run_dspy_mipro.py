@@ -23,6 +23,7 @@ from pact_el.benchmarks.splitting import select_three_way
 from pact_el.ux import (
     install_rich_tracebacks,
     print_config_table,
+    print_method_results_table,
     print_selection_summary,
     print_run_summary,
     print_title,
@@ -232,6 +233,7 @@ def main() -> None:
     if args.json:
         print(json.dumps(result.summary, indent=2, sort_keys=True))
     else:
+        print_method_results_table(result.summary)
         print_run_summary(result.summary)
 
 
