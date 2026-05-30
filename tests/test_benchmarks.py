@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
+from types import SimpleNamespace
 
 from pact_el.benchmarks.adapters import (
     drop_answer_to_strings,
@@ -192,6 +194,51 @@ def test_score_predictions_can_use_process_workers():
 
     assert [result.example_id for result in results] == ["n0", "n1"]
     assert summarize_scores(results)["accuracy"] == 0.5
+
+
+def test_ifbench_official_evaluator_metric_uses_installed_verifier(monkeypatch):
+    class FakeEvaluationLib:
+        class InputExample:
+            def __init__(self, key, instruction_id_list, prompt, kwargs):
+                self.key = key
+                self.instruction_id_list = instruction_id_list
+                self.prompt = prompt
+                self.kwargs = kwargs
+
+        @staticmethod
+        def test_instruction_following_loose(inp, prompt_to_response):
+            return SimpleNamespace(
+                instruction_id_list=inp.instruction_id_list,
+                prompt=inp.prompt,
+                response=prompt_to_response[inp.prompt],
+                follow_all_instructions=True,
+                follow_instruction_list=[True],
+            )
+
+    monkeypatch.setitem(sys.modules, "evaluation_lib", FakeEvaluationLib)
+    example = BenchmarkExample(
+        benchmark_id="ifbench",
+        example_id="ifbench:test:0",
+        split="test",
+        prompt="Say hello.",
+        expected_answer=None,
+        metric=MetricKind.OFFICIAL_EVALUATOR,
+        source_url="official",
+        metadata={
+            "official_input_row": {
+                "key": "0",
+                "prompt": "Say hello.",
+                "instruction_id_list": ["format:test"],
+                "kwargs": [{}],
+            }
+        },
+    )
+
+    result = score_prediction(example, "hello")
+
+    assert result.passed is True
+    assert result.score == 1.0
+    assert result.details["evaluator"] == "allenai/IFBench test_instruction_following_loose"
 
 
 def test_mbpp_scoring_requires_explicit_code_execution():

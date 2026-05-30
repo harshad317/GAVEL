@@ -17,6 +17,8 @@ from pact_el.baselines.dspy_mipro import (
     load_examples,
     run_dspy_baseline,
 )
+from pact_el.benchmarks.prepare import prepare_benchmark
+from pact_el.benchmarks.registry import get_benchmark_spec
 from pact_el.benchmarks.splitting import select_three_way
 from pact_el.ux import (
     install_rich_tracebacks,
@@ -29,6 +31,15 @@ from pact_el.ux import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--benchmark",
+        help="Official benchmark id to prepare and split inside this command, e.g. ifbench.",
+    )
+    parser.add_argument("--benchmark-out", default="data/benchmarks")
+    parser.add_argument("--train-split", help="Official split to use as the train pool with --benchmark.")
+    parser.add_argument("--val-split", help="Official split to use as the validation pool with --benchmark.")
+    parser.add_argument("--test-split", help="Official split to use as the test pool with --benchmark.")
+    parser.add_argument("--force-prepare", action="store_true", help="Redownload/rebuild benchmark JSONL files.")
     parser.add_argument("--eval-dataset", help="Normalized benchmark JSONL to evaluate. Alias: --test-dataset.")
     parser.add_argument("--test-dataset", help="Normalized benchmark JSONL used as the held-out test set.")
     parser.add_argument("--train-dataset", help="Normalized benchmark JSONL used by MIPROv2.")
@@ -92,13 +103,19 @@ def main() -> None:
     install_rich_tracebacks()
     args = build_parser().parse_args()
     test_dataset = args.test_dataset or args.eval_dataset
-    if test_dataset is None:
-        raise SystemExit("Provide --test-dataset or --eval-dataset.")
+    if test_dataset is None and args.benchmark is None:
+        raise SystemExit("Provide --test-dataset/--eval-dataset or --benchmark.")
     train_n = _coalesce_count(args.train_n, args.train_limit, "train")
     val_n = _coalesce_count(args.val_n, args.val_limit, "val")
     test_n = _coalesce_count(args.test_n, args.limit, "test")
     selection_seed = args.selection_seed if args.selection_seed is not None else args.seed
-    if args.optimizer == "mipro" and args.train_dataset and val_n is None and args.val_dataset is None:
+    if (
+        args.optimizer == "mipro"
+        and (args.train_dataset or args.benchmark)
+        and val_n is None
+        and args.val_dataset is None
+        and args.val_split is None
+    ):
         val_n = args.derived_val_size
     cache = _resolve_cache(args.cache, args.no_cache)
     lm_kwargs = _parse_lm_kwargs(args.lm_kwargs)
@@ -131,17 +148,29 @@ def main() -> None:
         workers=args.workers,
     )
 
-    train_pool = load_examples(Path(args.train_dataset)) if args.train_dataset else None
-    val_pool = load_examples(Path(args.val_dataset)) if args.val_dataset else None
-    test_pool = load_examples(Path(test_dataset))
+    train_pool, val_pool, test_pool, dataset_info = _load_or_prepare_pools(
+        args,
+        test_dataset=test_dataset,
+        show_progress=not args.no_progress,
+    )
     if args.optimizer == "mipro" and train_pool is None:
-        raise SystemExit("MIPROv2 requires --train-dataset.")
+        raise SystemExit("MIPROv2 requires --train-dataset or --benchmark.")
+    if (
+        args.optimizer == "mipro"
+        and dataset_info.get("single_official_pool")
+        and (train_n is None or val_n is None or test_n is None)
+    ):
+        raise SystemExit(
+            f"{dataset_info['benchmark']} has one configured official split in this registry; "
+            "pass --train-n, --val-n, and --test-n so the command can make disjoint subsets."
+        )
     if (
         args.optimizer == "mipro"
         and train_pool is not None
         and val_pool is None
         and val_n is not None
         and train_n is None
+        and not dataset_info.get("single_official_pool")
     ):
         train_n = max(0, len(train_pool) - val_n)
 
@@ -153,9 +182,11 @@ def main() -> None:
                 "optimizer": args.optimizer,
                 "program": args.program,
                 "model": args.model,
-                "test_dataset": test_dataset,
-                "train_dataset": args.train_dataset,
-                "val_dataset": args.val_dataset,
+                "benchmark": args.benchmark,
+                "test_dataset": dataset_info.get("test_dataset") or test_dataset,
+                "train_dataset": dataset_info.get("train_dataset") or args.train_dataset,
+                "val_dataset": dataset_info.get("val_dataset") or args.val_dataset,
+                "benchmark_out": args.benchmark_out if args.benchmark else None,
                 "auto": args.auto,
                 "workers": args.workers,
                 "cache": cache,
@@ -181,6 +212,8 @@ def main() -> None:
         test_n=test_n,
         seed=selection_seed,
     )
+    if dataset_info:
+        selection.manifest["dataset"] = dataset_info
     if args.optimizer == "mipro" and not selection.validation:
         raise SystemExit("MIPROv2 requires a non-empty validation set; pass --val-n or --val-dataset.")
     if not args.json:
@@ -210,6 +243,83 @@ def _parse_lm_kwargs(value: str) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise SystemExit("--lm-kwargs must decode to a JSON object")
     return parsed
+
+
+def _load_or_prepare_pools(
+    args: argparse.Namespace,
+    *,
+    test_dataset: Optional[str],
+    show_progress: bool,
+) -> tuple[Any, Any, Any, Dict[str, Any]]:
+    if args.benchmark is None:
+        train_pool = load_examples(Path(args.train_dataset)) if args.train_dataset else None
+        val_pool = load_examples(Path(args.val_dataset)) if args.val_dataset else None
+        if test_dataset is None:
+            raise SystemExit("Provide --test-dataset or --eval-dataset.")
+        test_pool = load_examples(Path(test_dataset))
+        return train_pool, val_pool, test_pool, {}
+
+    spec = get_benchmark_spec(args.benchmark)
+    out_dir = Path(args.benchmark_out)
+    prepared_paths: Dict[str, str] = {}
+
+    def prepare_split(split: str) -> Path:
+        if split not in prepared_paths:
+            path = prepare_benchmark(
+                spec.benchmark_id,
+                out_dir=out_dir,
+                split=split,
+                force=args.force_prepare,
+                show_progress=show_progress,
+            )
+            prepared_paths[split] = str(path)
+        return Path(prepared_paths[split])
+
+    test_split = args.test_split or spec.default_split
+    test_path = Path(test_dataset) if test_dataset else prepare_split(test_split)
+    test_pool = load_examples(test_path)
+
+    train_path = Path(args.train_dataset) if args.train_dataset else None
+    train_split = args.train_split
+    single_official_pool = False
+    if args.optimizer == "mipro":
+        if train_path is not None:
+            train_pool = load_examples(train_path)
+        elif train_split is not None:
+            train_path = prepare_split(train_split)
+            train_pool = load_examples(train_path)
+        else:
+            train_pool = test_pool
+            train_split = test_split
+            train_path = test_path
+            single_official_pool = True
+    else:
+        train_pool = None
+
+    val_path = Path(args.val_dataset) if args.val_dataset else None
+    val_split = args.val_split
+    if val_path is not None:
+        val_pool = load_examples(val_path)
+    elif val_split is not None:
+        val_path = prepare_split(val_split)
+        val_pool = load_examples(val_path)
+    else:
+        val_pool = None
+
+    dataset_info = {
+        "benchmark": spec.benchmark_id,
+        "official_url": spec.official_url,
+        "source_url": spec.source_url,
+        "prepared_paths": prepared_paths,
+        "train_split": train_split,
+        "validation_split": val_split,
+        "test_split": test_split,
+        "train_dataset": str(train_path) if train_path else None,
+        "val_dataset": str(val_path) if val_path else None,
+        "test_dataset": str(test_path),
+        "single_official_pool": single_official_pool,
+    }
+    return train_pool, val_pool, test_pool, dataset_info
 
 
 def _parse_bool(value: str) -> bool:

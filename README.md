@@ -32,6 +32,12 @@ For DSPy and MIPROv2 benchmark baselines, use Python 3.10+ and install:
 python -m pip install -e ".[baselines,dev]"
 ```
 
+For IFBench's official verifier, install the IFBench extra too:
+
+```bash
+python -m pip install -e ".[baselines,ifbench,dev]"
+```
+
 ## Minimal Example
 
 Run the deterministic replay example:
@@ -146,6 +152,28 @@ The runner follows the official DSPy GitHub API: `dspy.LM`,
 by this package's `baselines` extra. The runner writes prediction JSONL, score
 JSONL, a summary JSON, and the saved DSPy program when the compiled program
 supports `save(...)`.
+
+For benchmarks like IFBench, you can let the runner prepare the official data
+and then build leakage-safe subsets in the same command:
+
+```bash
+python3 experiments/run_dspy_mipro.py \
+  --benchmark ifbench \
+  --optimizer mipro \
+  --program cot \
+  --model openai/gpt-4.1-mini \
+  --train-n 50 \
+  --val-n 50 \
+  --test-n 200 \
+  --workers 16 \
+  --cache True \
+  --auto light \
+  --out output/baselines/ifbench_mipro
+```
+
+The current IFBench registry entry has one public official test split, so this
+command derives disjoint train, validation, and test subsets from that pool and
+records the split manifest in the summary JSON.
 
 ## Architecture
 

@@ -7,6 +7,8 @@ import math
 import re
 import subprocess
 import tempfile
+import copy
+import importlib
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -98,6 +100,11 @@ def score_prediction(
             allow_code_execution=allow_code_execution,
             timeout_seconds=timeout_seconds,
         )
+    if (
+        example.metric == MetricKind.OFFICIAL_EVALUATOR
+        and example.benchmark_id == "ifbench"
+    ):
+        return _score_ifbench_official(example, prediction)
     return ScoreResult(
         example_id=example.example_id,
         metric=example.metric,
@@ -341,6 +348,69 @@ def _score_pass_at_1(
             "stderr": completed.stderr[-2000:],
         },
     )
+
+
+def _score_ifbench_official(example: BenchmarkExample, prediction: Any) -> ScoreResult:
+    row = example.metadata.get("official_input_row") or {}
+    if not row:
+        return ScoreResult(
+            example_id=example.example_id,
+            metric=example.metric,
+            score=None,
+            passed=None,
+            prediction=prediction,
+            expected=example.expected_answer,
+            details={"reason": "IFBench example is missing official_input_row metadata"},
+        )
+
+    try:
+        evaluation_lib = _import_ifbench_evaluation_lib()
+    except ModuleNotFoundError as exc:
+        return ScoreResult(
+            example_id=example.example_id,
+            metric=example.metric,
+            score=None,
+            passed=None,
+            prediction=prediction,
+            expected=example.expected_answer,
+            details={
+                "reason": "official IFBench evaluator is not installed",
+                "install": "python -m pip install -e '.[ifbench]'",
+                "missing_module": exc.name,
+            },
+        )
+
+    inp = evaluation_lib.InputExample(
+        key=row.get("key"),
+        instruction_id_list=list(row.get("instruction_id_list") or []),
+        prompt=str(row.get("prompt", example.prompt)),
+        kwargs=copy.deepcopy(list(row.get("kwargs") or [])),
+    )
+    output = evaluation_lib.test_instruction_following_loose(
+        inp,
+        {inp.prompt: "" if prediction is None else str(prediction)},
+    )
+    passed = bool(output.follow_all_instructions)
+    return ScoreResult(
+        example_id=example.example_id,
+        metric=example.metric,
+        score=1.0 if passed else 0.0,
+        passed=passed,
+        prediction=prediction,
+        expected=example.expected_answer,
+        details={
+            "evaluator": "allenai/IFBench test_instruction_following_loose",
+            "instruction_id_list": list(output.instruction_id_list),
+            "follow_instruction_list": list(output.follow_instruction_list),
+        },
+    )
+
+
+def _import_ifbench_evaluation_lib() -> Any:
+    try:
+        return importlib.import_module("evaluation_lib")
+    except ModuleNotFoundError:
+        return importlib.import_module("ifbench.evaluation_lib")
 
 
 def extract_choice(prediction: str, choices: Sequence[str]) -> Optional[str]:
