@@ -17,6 +17,12 @@ from pact_el.baselines.dspy_mipro import (
     load_examples,
     run_dspy_baseline,
 )
+from pact_el.ux import (
+    install_rich_tracebacks,
+    print_config_table,
+    print_run_summary,
+    print_title,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,10 +62,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow MBPP generated code execution during scoring.",
     )
     parser.add_argument("--no-save-program", action="store_true")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of rich output.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     return parser
 
 
 def main() -> None:
+    install_rich_tracebacks()
     args = build_parser().parse_args()
     lm_kwargs = _parse_lm_kwargs(args.lm_kwargs)
     config = DSPyMIPROConfig(
@@ -87,7 +96,26 @@ def main() -> None:
         seed=args.seed,
         allow_code_execution=args.allow_code_execution,
         save_program=not args.no_save_program,
+        show_progress=not args.no_progress,
     )
+
+    if not args.json:
+        print_title("GAVEL DSPy Baseline", f"{args.optimizer} / {args.program}")
+        print_config_table(
+            "Run Configuration",
+            {
+                "optimizer": args.optimizer,
+                "program": args.program,
+                "model": args.model,
+                "eval_dataset": args.eval_dataset,
+                "train_dataset": args.train_dataset,
+                "val_dataset": args.val_dataset,
+                "auto": args.auto,
+                "limit": args.limit,
+                "train_limit": args.train_limit,
+                "out": args.out,
+            },
+        )
 
     eval_examples = load_examples(Path(args.eval_dataset), limit=args.limit)
     train_examples = (
@@ -117,7 +145,10 @@ def main() -> None:
         )
     except MissingDSPyError as exc:
         raise SystemExit(str(exc)) from exc
-    print(json.dumps(result.summary, indent=2, sort_keys=True))
+    if args.json:
+        print(json.dumps(result.summary, indent=2, sort_keys=True))
+    else:
+        print_run_summary(result.summary)
 
 
 def _parse_lm_kwargs(value: str) -> Dict[str, Any]:

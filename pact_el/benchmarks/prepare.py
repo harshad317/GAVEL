@@ -10,6 +10,8 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from tqdm.auto import tqdm
+
 from pact_el.benchmarks.adapters import normalize_examples
 from pact_el.benchmarks.registry import get_benchmark_spec, list_benchmarks
 from pact_el.benchmarks.schemas import (
@@ -25,6 +27,7 @@ def prepare_benchmark(
     split: Optional[str] = None,
     limit: Optional[int] = None,
     force: bool = False,
+    show_progress: bool = False,
 ) -> Path:
     """Download official data and write normalized examples to JSONL."""
 
@@ -43,10 +46,11 @@ def prepare_benchmark(
                 source_dir,
                 force=force,
                 max_rows=limit,
+                show_progress=show_progress,
             )
             source_paths.append(source_dir / (source.local_name or f"{source.source_id}.jsonl"))
             continue
-        source_path = _ensure_source(source, source_dir, force=force)
+        source_path = _ensure_source(source, source_dir, force=force, show_progress=show_progress)
         if source.kind == SourceKind.ARCHIVE:
             source_paths.extend(_extract_archive(source_path, source_dir, force=force))
         else:
@@ -79,10 +83,21 @@ def prepare_all(
     split_overrides: Optional[Mapping[str, str]] = None,
     limit: Optional[int] = None,
     force: bool = False,
+    show_progress: bool = False,
 ) -> Dict[str, Path]:
     paths: Dict[str, Path] = {}
     overrides = dict(split_overrides or {})
-    for spec in list_benchmarks():
+    specs = list_benchmarks()
+    iterator = tqdm(
+        specs,
+        desc="Preparing benchmarks",
+        unit="benchmark",
+        colour="cyan",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+    for spec in iterator:
+        iterator.set_postfix(current=spec.benchmark_id)
         split = overrides.get(spec.benchmark_id, spec.default_split)
         paths[spec.benchmark_id] = prepare_benchmark(
             spec.benchmark_id,
@@ -90,6 +105,7 @@ def prepare_all(
             split=split,
             limit=limit,
             force=force,
+            show_progress=show_progress,
         )
     return paths
 
@@ -109,24 +125,51 @@ def _sources_for_split(
     return selected
 
 
-def _ensure_source(source: BenchmarkSource, source_dir: Path, force: bool) -> Path:
+def _ensure_source(
+    source: BenchmarkSource,
+    source_dir: Path,
+    force: bool,
+    show_progress: bool = False,
+) -> Path:
     path = source_dir / (source.local_name or Path(urllib.parse.urlparse(source.url or "").path).name)
     if path.exists() and not force:
         return path
     if source.url is None:
         raise ValueError(f"source {source.source_id} has no URL")
-    _download(source.url, path)
+    _download(source.url, path, show_progress=show_progress, desc=source.source_id)
     return path
 
 
-def _download(url: str, path: Path) -> None:
+def _download(
+    url: str,
+    path: Path,
+    show_progress: bool = False,
+    desc: Optional[str] = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "pact-el-benchmark-preparer/0.1"},
     )
     with urllib.request.urlopen(request, timeout=120) as response:
-        path.write_bytes(response.read())
+        total = response.headers.get("Content-Length")
+        total_bytes = int(total) if total and total.isdigit() else None
+        with tqdm(
+            total=total_bytes,
+            desc=desc or path.name,
+            unit="B",
+            unit_scale=True,
+            colour="cyan",
+            dynamic_ncols=True,
+            disable=not show_progress,
+        ) as progress:
+            with path.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 256)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    progress.update(len(chunk))
 
 
 def _extract_archive(path: Path, source_dir: Path, force: bool) -> List[Path]:
@@ -164,6 +207,7 @@ def _load_hf_rows(
     force: bool,
     page_size: int = 100,
     max_rows: Optional[int] = None,
+    show_progress: bool = False,
 ) -> List[Mapping[str, Any]]:
     local_path = source_dir / (source.local_name or f"{source.source_id}.jsonl")
     if max_rows is not None:
@@ -175,31 +219,48 @@ def _load_hf_rows(
 
     rows: List[Mapping[str, Any]] = []
     offset = 0
-    while True:
-        params = urllib.parse.urlencode(
-            {
-                "dataset": source.hf_dataset_id,
-                "config": source.hf_config,
-                "split": source.hf_split,
-                "offset": offset,
-                "length": page_size,
-            }
-        )
-        url = f"https://datasets-server.huggingface.co/rows?{params}"
-        request = urllib.request.Request(
-            url,
-            headers={"User-Agent": "pact-el-benchmark-preparer/0.1"},
-        )
-        with urllib.request.urlopen(request, timeout=120) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        page_rows = [item["row"] for item in payload.get("rows", [])]
-        rows.extend(page_rows)
-        if max_rows is not None and len(rows) >= max_rows:
-            rows = rows[:max_rows]
-            break
-        if len(page_rows) < page_size:
-            break
-        offset += page_size
+    with tqdm(
+        total=max_rows,
+        desc=source.source_id,
+        unit="row",
+        colour="cyan",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    ) as progress:
+        while True:
+            requested_rows = page_size
+            if max_rows is not None:
+                requested_rows = min(page_size, max_rows - len(rows))
+                if requested_rows <= 0:
+                    break
+            params = urllib.parse.urlencode(
+                {
+                    "dataset": source.hf_dataset_id,
+                    "config": source.hf_config,
+                    "split": source.hf_split,
+                    "offset": offset,
+                    "length": requested_rows,
+                }
+            )
+            url = f"https://datasets-server.huggingface.co/rows?{params}"
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "pact-el-benchmark-preparer/0.1"},
+            )
+            with urllib.request.urlopen(request, timeout=120) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            page_rows = [item["row"] for item in payload.get("rows", [])]
+            if max_rows is not None:
+                page_rows = page_rows[: max_rows - len(rows)]
+            rows.extend(page_rows)
+            progress.update(len(page_rows))
+            progress.set_postfix(rows=len(rows))
+            if max_rows is not None and len(rows) >= max_rows:
+                rows = rows[:max_rows]
+                break
+            if len(page_rows) < requested_rows:
+                break
+            offset += requested_rows
 
     local_path.write_text(
         "\n".join(json.dumps(row, sort_keys=True) for row in rows) + ("\n" if rows else "")

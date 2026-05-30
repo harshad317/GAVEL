@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from tqdm.auto import tqdm
+
 from pact_el.benchmarks.scoring import (
     load_normalized_examples,
     score_prediction,
@@ -61,6 +63,7 @@ class DSPyMIPROConfig:
     allow_code_execution: bool = False
     save_program: bool = True
     prediction_field: str = "answer"
+    show_progress: bool = True
 
     def validate(self) -> None:
         if self.optimizer not in {"dspy", "mipro"}:
@@ -171,6 +174,7 @@ def run_dspy_baseline(
         eval_examples,
         allow_code_execution=config.allow_code_execution,
         prediction_field=config.prediction_field,
+        show_progress=config.show_progress,
     )
 
     run_name = _run_name(config)
@@ -299,26 +303,51 @@ def evaluate_program(
     examples: Sequence[BenchmarkExample],
     allow_code_execution: bool = False,
     prediction_field: str = "answer",
+    show_progress: bool = False,
 ) -> tuple[List[Dict[str, Any]], List[ScoreResult]]:
     predictions: List[Dict[str, Any]] = []
     scores: List[ScoreResult] = []
-    for example in examples:
-        raw_prediction = program(question=example.prompt)
-        prediction = _prediction_text(raw_prediction, field=prediction_field)
-        score = score_prediction(
-            example,
-            prediction,
-            allow_code_execution=allow_code_execution,
-        )
-        predictions.append(
-            {
-                "example_id": example.example_id,
-                "benchmark_id": example.benchmark_id,
-                "prediction": prediction,
-                "raw_prediction": _json_safe_prediction(raw_prediction),
-            }
-        )
-        scores.append(score)
+    progress = tqdm(
+        total=len(examples),
+        desc="DSPy eval",
+        unit="ex",
+        colour="magenta",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+    scored = 0
+    passed = 0
+    score_total = 0.0
+    with progress:
+        for example in examples:
+            raw_prediction = program(question=example.prompt)
+            prediction = _prediction_text(raw_prediction, field=prediction_field)
+            score = score_prediction(
+                example,
+                prediction,
+                allow_code_execution=allow_code_execution,
+            )
+            predictions.append(
+                {
+                    "example_id": example.example_id,
+                    "benchmark_id": example.benchmark_id,
+                    "prediction": prediction,
+                    "raw_prediction": _json_safe_prediction(raw_prediction),
+                }
+            )
+            scores.append(score)
+            if score.score is not None:
+                scored += 1
+                score_total += float(score.score)
+                if score.passed is True:
+                    passed += 1
+                progress.set_postfix(
+                    scored=scored,
+                    passed=passed,
+                    mean=f"{score_total / scored:.3f}",
+                    refresh=False,
+                )
+            progress.update(1)
     return predictions, scores
 
 

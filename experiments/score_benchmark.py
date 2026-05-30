@@ -15,6 +15,7 @@ from pact_el.benchmarks.scoring import (
     score_predictions,
     summarize_scores,
 )
+from pact_el.ux import install_rich_tracebacks, print_score_summary, print_title
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,24 +28,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Execute generated code for MBPP pass@1 scoring.",
     )
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of rich output.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     return parser
 
 
 def main() -> None:
+    install_rich_tracebacks()
     args = build_parser().parse_args()
+    if not args.json:
+        print_title("GAVEL Benchmark Scoring", Path(args.dataset).name)
     examples = load_normalized_examples(Path(args.dataset))
     predictions = load_predictions(Path(args.predictions))
     results = score_predictions(
         examples,
         predictions,
         allow_code_execution=args.allow_code_execution,
+        show_progress=not args.no_progress,
+        description=f"Scoring {Path(args.dataset).stem}",
     )
     if args.out:
         Path(args.out).write_text(
             "\n".join(result.model_dump_json() for result in results)
             + ("\n" if results else "")
         )
-    print(json.dumps(summarize_scores(results), indent=2, sort_keys=True))
+    summary = summarize_scores(results)
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print_score_summary("Score Summary", summary)
 
 
 if __name__ == "__main__":

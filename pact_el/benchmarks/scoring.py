@@ -11,6 +11,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
+from tqdm.auto import tqdm
+
 from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind, ScoreResult
 
 
@@ -53,17 +55,42 @@ def score_predictions(
     examples: Sequence[BenchmarkExample],
     predictions: Mapping[str, Any],
     allow_code_execution: bool = False,
+    show_progress: bool = False,
+    description: str = "Scoring",
 ) -> List[ScoreResult]:
     results: List[ScoreResult] = []
-    for example in examples:
-        prediction = predictions.get(example.example_id)
-        results.append(
-            score_prediction(
+    progress = tqdm(
+        total=len(examples),
+        desc=description,
+        unit="ex",
+        colour="green",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+    scored = 0
+    passed = 0
+    score_total = 0.0
+    with progress:
+        for example in examples:
+            prediction = predictions.get(example.example_id)
+            result = score_prediction(
                 example,
                 prediction,
                 allow_code_execution=allow_code_execution,
             )
-        )
+            results.append(result)
+            if result.score is not None:
+                scored += 1
+                score_total += float(result.score)
+                if result.passed is True:
+                    passed += 1
+                progress.set_postfix(
+                    scored=scored,
+                    passed=passed,
+                    mean=f"{score_total / scored:.3f}",
+                    refresh=False,
+                )
+            progress.update(1)
     return results
 
 
@@ -311,4 +338,3 @@ def _strip_markdown_fences(text: str) -> str:
             lines = lines[:-1]
         return "\n".join(lines)
     return text
-
