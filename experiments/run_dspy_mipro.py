@@ -1,4 +1,4 @@
-"""Run DSPy direct and MIPROv2 baselines over normalized benchmark JSONL files."""
+"""Run DSPy direct, MIPROv2, and GEPA baselines over normalized benchmark JSONL files."""
 
 from __future__ import annotations
 
@@ -43,10 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force-prepare", action="store_true", help="Redownload/rebuild benchmark JSONL files.")
     parser.add_argument("--eval-dataset", help="Normalized benchmark JSONL to evaluate. Alias: --test-dataset.")
     parser.add_argument("--test-dataset", help="Normalized benchmark JSONL used as the held-out test set.")
-    parser.add_argument("--train-dataset", help="Normalized benchmark JSONL used by MIPROv2.")
-    parser.add_argument("--val-dataset", help="Optional normalized validation JSONL for MIPROv2.")
+    parser.add_argument("--train-dataset", help="Normalized benchmark JSONL used by MIPROv2/GEPA.")
+    parser.add_argument("--val-dataset", help="Optional normalized validation JSONL for MIPROv2/GEPA.")
     parser.add_argument("--out", default="output/baselines/dspy_mipro")
-    parser.add_argument("--optimizer", choices=["dspy", "mipro"], default="mipro")
+    parser.add_argument("--optimizer", choices=["dspy", "mipro", "gepa"], default="mipro")
     parser.add_argument("--program", choices=["predict", "cot", "chain_of_thought"], default="cot")
     parser.add_argument("--model", default=os.getenv("DSPY_MODEL", "openai/gpt-4o-mini"))
     parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"))
@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=_parse_workers,
         default=1,
-        help="Concurrent workers for final evaluation; also used as MIPRO num_threads unless overridden.",
+        help="Concurrent workers for final evaluation; also used as optimizer num_threads unless overridden.",
     )
     parser.add_argument(
         "--cache",
@@ -71,8 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-cache", action="store_true", help="Legacy alias for --cache False.")
     parser.add_argument("--lm-kwargs", default="{}", help="Additional JSON kwargs passed to dspy.LM.")
     parser.add_argument("--test-n", type=int, help="Number of leakage-free test examples to evaluate.")
-    parser.add_argument("--train-n", type=int, help="Number of leakage-free training examples for MIPROv2.")
-    parser.add_argument("--val-n", type=int, help="Number of leakage-free validation examples for MIPROv2.")
+    parser.add_argument("--train-n", type=int, help="Number of leakage-free training examples.")
+    parser.add_argument("--val-n", type=int, help="Number of leakage-free validation examples.")
     parser.add_argument("--limit", type=int, help="Deprecated alias for --test-n.")
     parser.add_argument("--train-limit", type=int, help="Deprecated alias for --train-n.")
     parser.add_argument("--val-limit", type=int, help="Deprecated alias for --val-n.")
@@ -81,13 +81,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto", choices=["light", "medium", "heavy", "none"], default="light")
     parser.add_argument("--num-candidates", type=int)
     parser.add_argument("--num-trials", type=int)
-    parser.add_argument("--num-threads", type=int, help="Override MIPROv2 compile threads.")
+    parser.add_argument("--num-threads", type=int, help="Override optimizer compile/evaluation threads.")
+    parser.add_argument("--max-metric-calls", type=int, help="GEPA metric-call budget when --auto none.")
+    parser.add_argument("--max-full-evals", type=int, help="GEPA full-evaluation budget when --auto none.")
     parser.add_argument("--max-bootstrapped-demos", type=int, default=4)
     parser.add_argument("--max-labeled-demos", type=int, default=4)
     parser.add_argument("--metric-threshold", type=float)
     parser.add_argument("--no-minibatch", action="store_true")
     parser.add_argument("--minibatch-size", type=int, default=35)
     parser.add_argument("--minibatch-full-eval-steps", type=int, default=5)
+    parser.add_argument("--reflection-model", help="GEPA reflection LM. Defaults to --model.")
+    parser.add_argument("--reflection-temperature", type=float)
+    parser.add_argument("--reflection-max-tokens", type=int)
+    parser.add_argument("--reflection-minibatch-size", type=int, default=3)
     parser.add_argument("--seed", type=int, default=9)
     parser.add_argument(
         "--allow-code-execution",
@@ -111,7 +117,7 @@ def main() -> None:
     test_n = _coalesce_count(args.test_n, args.limit, "test")
     selection_seed = args.selection_seed if args.selection_seed is not None else args.seed
     if (
-        args.optimizer == "mipro"
+        args.optimizer in {"mipro", "gepa"}
         and (args.train_dataset or args.benchmark)
         and val_n is None
         and args.val_dataset is None
@@ -136,12 +142,18 @@ def main() -> None:
         num_candidates=args.num_candidates,
         num_trials=args.num_trials,
         num_threads=args.num_threads,
+        max_metric_calls=args.max_metric_calls,
+        max_full_evals=args.max_full_evals,
         max_bootstrapped_demos=args.max_bootstrapped_demos,
         max_labeled_demos=args.max_labeled_demos,
         metric_threshold=args.metric_threshold,
         minibatch=not args.no_minibatch,
         minibatch_size=args.minibatch_size,
         minibatch_full_eval_steps=args.minibatch_full_eval_steps,
+        reflection_model=args.reflection_model,
+        reflection_temperature=args.reflection_temperature,
+        reflection_max_tokens=args.reflection_max_tokens,
+        reflection_minibatch_size=args.reflection_minibatch_size,
         seed=args.seed,
         allow_code_execution=args.allow_code_execution,
         save_program=not args.no_save_program,
@@ -154,10 +166,12 @@ def main() -> None:
         test_dataset=test_dataset,
         show_progress=not args.no_progress,
     )
-    if args.optimizer == "mipro" and train_pool is None:
-        raise SystemExit("MIPROv2 requires --train-dataset or --benchmark.")
+    needs_optimization_data = args.optimizer in {"mipro", "gepa"}
+    optimizer_label = "MIPROv2" if args.optimizer == "mipro" else "GEPA"
+    if needs_optimization_data and train_pool is None:
+        raise SystemExit(f"{optimizer_label} requires --train-dataset or --benchmark.")
     if (
-        args.optimizer == "mipro"
+        needs_optimization_data
         and dataset_info.get("single_official_pool")
         and (train_n is None or val_n is None or test_n is None)
     ):
@@ -166,7 +180,7 @@ def main() -> None:
             "pass --train-n, --val-n, and --test-n so the command can make disjoint subsets."
         )
     if (
-        args.optimizer == "mipro"
+        needs_optimization_data
         and train_pool is not None
         and val_pool is None
         and val_n is not None
@@ -194,8 +208,13 @@ def main() -> None:
                 "num_threads": (
                     args.num_threads
                     if args.num_threads is not None
-                    else args.workers if args.optimizer == "mipro" else None
+                    else args.workers if needs_optimization_data else None
                 ),
+                "reflection_model": (
+                    (args.reflection_model or args.model) if args.optimizer == "gepa" else None
+                ),
+                "max_metric_calls": args.max_metric_calls,
+                "max_full_evals": args.max_full_evals,
                 "train_n": train_n,
                 "val_n": val_n,
                 "test_n": test_n,
@@ -215,8 +234,10 @@ def main() -> None:
     )
     if dataset_info:
         selection.manifest["dataset"] = dataset_info
-    if args.optimizer == "mipro" and not selection.validation:
-        raise SystemExit("MIPROv2 requires a non-empty validation set; pass --val-n or --val-dataset.")
+    if needs_optimization_data and not selection.validation:
+        raise SystemExit(
+            f"{optimizer_label} requires a non-empty validation set; pass --val-n or --val-dataset."
+        )
     if not args.json:
         print_selection_summary(selection.manifest)
 
@@ -284,7 +305,7 @@ def _load_or_prepare_pools(
     train_path = Path(args.train_dataset) if args.train_dataset else None
     train_split = args.train_split
     single_official_pool = False
-    if args.optimizer == "mipro":
+    if args.optimizer in {"mipro", "gepa"}:
         if train_path is not None:
             train_pool = load_examples(train_path)
         elif train_split is not None:

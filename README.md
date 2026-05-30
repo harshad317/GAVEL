@@ -26,7 +26,7 @@ For LiteLLM-backed optimizer or target clients:
 python -m pip install -e ".[litellm,dev]"
 ```
 
-For DSPy and MIPROv2 benchmark baselines, use Python 3.10+ and install:
+For DSPy, MIPROv2, and GEPA benchmark baselines, use Python 3.10+ and install:
 
 ```bash
 python -m pip install -e ".[baselines,dev]"
@@ -101,7 +101,7 @@ Source policy:
 - MBPP pass@1 requires executing generated code. Local scoring refuses to execute code unless `--allow-code-execution` is passed.
 - HotpotQA, MMLU, LiveBench Math, and MMLU-Pro use official Hugging Face dataset mirrors for row paging where the canonical repo points to large archives or where the official codebase itself loads from Hugging Face.
 
-### DSPy and MIPROv2 Baselines
+### DSPy, MIPROv2, and GEPA Baselines
 
 Run a direct DSPy program over a normalized benchmark:
 
@@ -138,18 +138,39 @@ python3 experiments/run_dspy_mipro.py \
   --out output/baselines/gsm8k_mipro
 ```
 
+Run DSPy's GEPA optimizer with the same benchmark/split flow:
+
+```bash
+python3 experiments/run_dspy_mipro.py \
+  --benchmark ifbench \
+  --optimizer gepa \
+  --program cot \
+  --model openai/gpt-4.1-mini \
+  --train-n 50 \
+  --val-n 50 \
+  --test-n 200 \
+  --workers 16 \
+  --cache True \
+  --auto heavy \
+  --out output/baselines/ifbench_gepa
+```
+
+GEPA uses `--model` as the reflection LM by default. To use a stronger
+reflection model without changing the task model, pass `--reflection-model`.
+
 `--train-n`, `--val-n`, and `--test-n` select deterministic, leakage-checked
 subsets. The runner rejects overlaps by `example_id` and by normalized prompt
-fingerprint before calling DSPy/MIPROv2.
+fingerprint before calling DSPy/MIPROv2/GEPA.
 
-`--workers` controls concurrent final evaluation. For MIPROv2 it is also used
-as `num_threads` unless `--num-threads` is passed. `--cache True` and
-`--cache False` explicitly control DSPy's LM cache.
+`--workers` controls concurrent final evaluation. For MIPROv2 and GEPA it is
+also used as `num_threads` unless `--num-threads` is passed. `--cache True`
+and `--cache False` explicitly control DSPy's LM cache.
 
 The runner follows the official DSPy GitHub API: `dspy.LM`,
 `dspy.configure`, `dspy.Predict` / `dspy.ChainOfThought`, and
-`dspy.MIPROv2.compile(...)`. MIPROv2 requires DSPy's `optuna` extra, included
-by this package's `baselines` extra. The runner writes prediction JSONL, score
+`dspy.MIPROv2.compile(...)` / `dspy.GEPA.compile(...)`. MIPROv2 requires
+DSPy's `optuna` extra, included by this package's `baselines` extra. GEPA is
+included in DSPy's runtime dependency set. The runner writes prediction JSONL, score
 JSONL, a summary JSON, and the saved DSPy program when the compiled program
 supports `save(...)`.
 
@@ -193,11 +214,11 @@ history exposes that count.
 - `pact_el.falsification`: acceptance, rollback, token-delta, regression, and no-patch logic.
 - `pact_el.optimize`: end-to-end PACT-EL orchestration.
 - `pact_el.benchmarks`: official-source benchmark registry, preparation adapters, and local scoring utilities.
-- `pact_el.baselines`: optional DSPy and MIPROv2 runners for normalized benchmarks.
+- `pact_el.baselines`: optional DSPy, MIPROv2, and GEPA runners for normalized benchmarks.
 - `experiments/run.py`: cached matched-budget experiment runner with ablation toggles.
 - `experiments/prepare_benchmarks.py`: download and normalize official benchmarks.
 - `experiments/score_benchmark.py`: score JSON/JSONL predictions against normalized examples.
-- `experiments/run_dspy_mipro.py`: run direct DSPy and DSPy MIPROv2 baselines.
+- `experiments/run_dspy_mipro.py`: run direct DSPy, DSPy MIPROv2, and DSPy GEPA baselines.
 
 ## Design Invariants
 

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from pact_el.baselines.dspy_mipro import (
     DSPyMIPROConfig,
     build_dspy_metric,
+    build_gepa_metric,
     run_dspy_baseline,
 )
 from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind
@@ -60,10 +61,24 @@ class FakeMIPROv2:
         return program
 
 
+class FakeGEPA:
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.compile_kwargs = None
+        FakeGEPA.instances.append(self)
+
+    def compile(self, program, **kwargs):
+        self.compile_kwargs = kwargs
+        return program
+
+
 class FakeLM:
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
+        self.history = []
 
 
 def fake_dspy_module():
@@ -72,6 +87,7 @@ def fake_dspy_module():
         Predict=FakeProgram,
         ChainOfThought=FakeProgram,
         MIPROv2=FakeMIPROv2,
+        GEPA=FakeGEPA,
         LM=FakeLM,
         configured=None,
         configure=lambda **kwargs: setattr(fake_dspy_module.module, "configured", kwargs),
@@ -85,6 +101,7 @@ def install_fake_dspy(monkeypatch):
     module = fake_dspy_module()
     fake_dspy_module.module = module
     FakeMIPROv2.instances = []
+    FakeGEPA.instances = []
     monkeypatch.setitem(sys.modules, "dspy", module)
     return module
 
@@ -113,6 +130,23 @@ def test_dspy_metric_delegates_to_normalized_scorer():
 
     assert metric(dspy_example, SimpleNamespace(answer="Answer: 4")) == 1.0
     assert metric(dspy_example, SimpleNamespace(answer="Answer: 5")) == 0.0
+
+
+def test_gepa_metric_returns_feedback_score():
+    example = numeric_example()
+    dspy_example = FakeDSPyExample(
+        question=example.prompt,
+        answer=example.expected_answer,
+        benchmark_example=example.model_dump(mode="json"),
+    ).with_inputs("question")
+
+    metric = build_gepa_metric()
+    result = metric(dspy_example, SimpleNamespace(answer="Answer: 4"), None, None, None)
+
+    assert result["score"] == 1.0
+    assert result.score == 1.0
+    assert sum([result]) == 1.0
+    assert "Metric: numeric_exact" in result.feedback
 
 
 def test_direct_dspy_baseline_writes_predictions_and_scores(tmp_path, monkeypatch):
@@ -180,3 +214,43 @@ def test_mipro_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):
     assert result.summary["split_results"]["val"]["score"] == 1.0
     assert result.summary["split_results"]["test"]["score"] == 1.0
     assert "optimization" in result.summary["split_results"]
+
+
+def test_gepa_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):
+    install_fake_dspy(monkeypatch)
+    config = DSPyMIPROConfig(
+        optimizer="gepa",
+        program="cot",
+        model="fake/model",
+        output_dir=tmp_path,
+        auto="heavy",
+        seed=123,
+        workers=16,
+        reflection_model="fake/reflection",
+        reflection_minibatch_size=2,
+    )
+    train = [numeric_example("gsm8k:train:0"), numeric_example("gsm8k:train:1")]
+    val = [numeric_example("gsm8k:validation:0")]
+
+    result = run_dspy_baseline(
+        [numeric_example()],
+        config=config,
+        train_examples=train,
+        val_examples=val,
+    )
+
+    [gepa] = FakeGEPA.instances
+    assert gepa.kwargs["metric"]
+    assert gepa.kwargs["auto"] == "heavy"
+    assert gepa.kwargs["seed"] == 123
+    assert gepa.kwargs["num_threads"] == 16
+    assert gepa.kwargs["reflection_minibatch_size"] == 2
+    assert gepa.kwargs["reflection_lm"].args[0] == "fake/reflection"
+    assert len(gepa.compile_kwargs["trainset"]) == 2
+    assert len(gepa.compile_kwargs["valset"]) == 1
+    assert result.summary["optimizer"] == "gepa"
+    assert result.summary["method"] == "gepa"
+    assert result.summary["reflection_model"] == "fake/reflection"
+    assert result.summary["split_results"]["train"]["score"] == 1.0
+    assert result.summary["split_results"]["val"]["score"] == 1.0
+    assert result.summary["split_results"]["test"]["score"] == 1.0
