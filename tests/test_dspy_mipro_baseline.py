@@ -126,6 +126,7 @@ def test_direct_dspy_baseline_writes_predictions_and_scores(tmp_path, monkeypatc
 
     result = run_dspy_baseline([numeric_example()], config=config)
 
+    assert result.summary["accuracy"] == 1.0
     assert result.summary["mean_score"] == 1.0
     assert result.predictions_path.exists()
     assert result.scores_path.exists()

@@ -321,7 +321,6 @@ def evaluate_program(
     )
     scored = 0
     passed = 0
-    score_total = 0.0
     with progress:
         for example in examples:
             raw_prediction = program(question=example.prompt)
@@ -342,13 +341,12 @@ def evaluate_program(
             scores.append(score)
             if score.score is not None:
                 scored += 1
-                score_total += float(score.score)
                 if score.passed is True:
                     passed += 1
                 progress.set_postfix(
                     scored=scored,
                     passed=passed,
-                    mean=f"{score_total / scored:.3f}",
+                    accuracy=f"{passed / scored:.1%}",
                     refresh=False,
                 )
             progress.update(1)

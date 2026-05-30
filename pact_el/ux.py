@@ -68,6 +68,12 @@ def print_score_summary(title: str, summary: Mapping[str, Any]) -> None:
     table.add_row("Scored", str(summary.get("scored", 0)), style="green")
     table.add_row("Unscored", str(summary.get("unscored", 0)), style=_count_style(summary.get("unscored", 0)))
     table.add_row("Passed", str(summary.get("passed", 0)), style="green")
+    accuracy = summary.get("accuracy")
+    table.add_row(
+        "Accuracy",
+        "n/a" if accuracy is None else f"{float(accuracy):.2%}",
+        style=_score_style(accuracy),
+    )
     mean_score = summary.get("mean_score")
     table.add_row(
         "Mean Score",
@@ -88,6 +94,7 @@ def print_run_summary(summary: Mapping[str, Any]) -> None:
         "eval_examples",
         "train_examples",
         "val_examples",
+        "accuracy",
         "mean_score",
         "passed",
         "scored",
@@ -97,7 +104,9 @@ def print_run_summary(summary: Mapping[str, Any]) -> None:
         "program_path",
     ):
         value = summary.get(key)
-        style = _score_style(value) if key == "mean_score" else "white"
+        style = _score_style(value) if key in {"accuracy", "mean_score"} else "white"
+        if key == "accuracy" and value is not None:
+            value = f"{float(value):.2%}"
         if key == "mean_score" and value is not None:
             value = f"{float(value):.4f}"
         table.add_row(key, "n/a" if value is None else str(value), style=style)

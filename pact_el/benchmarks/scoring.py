@@ -69,7 +69,6 @@ def score_predictions(
     )
     scored = 0
     passed = 0
-    score_total = 0.0
     with progress:
         for example in examples:
             prediction = predictions.get(example.example_id)
@@ -81,13 +80,12 @@ def score_predictions(
             results.append(result)
             if result.score is not None:
                 scored += 1
-                score_total += float(result.score)
                 if result.passed is True:
                     passed += 1
                 progress.set_postfix(
                     scored=scored,
                     passed=passed,
-                    mean=f"{score_total / scored:.3f}",
+                    accuracy=f"{passed / scored:.1%}",
                     refresh=False,
                 )
             progress.update(1)
@@ -102,6 +100,7 @@ def summarize_scores(results: Sequence[ScoreResult]) -> Dict[str, Any]:
         "scored": len(scored),
         "unscored": len(results) - len(scored),
         "passed": len(passed),
+        "accuracy": len(passed) / len(scored) if scored else None,
         "mean_score": (
             sum(float(result.score) for result in scored) / len(scored)
             if scored

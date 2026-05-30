@@ -9,7 +9,7 @@ from pact_el.benchmarks.adapters import (
     normalize_examples,
 )
 from pact_el.benchmarks.registry import get_benchmark_spec, list_benchmarks
-from pact_el.benchmarks.scoring import score_prediction
+from pact_el.benchmarks.scoring import score_prediction, summarize_scores
 from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind
 
 
@@ -111,6 +111,27 @@ def test_scoring_numeric_multiple_choice_and_f1():
     assert score_prediction(f1, "4 July 1776").score == 1.0
 
 
+def test_score_summary_reports_accuracy_separately_from_mean_score():
+    numeric = BenchmarkExample(
+        benchmark_id="gsm8k",
+        example_id="n",
+        split="test",
+        prompt="",
+        expected_answer="1200",
+        metric=MetricKind.NUMERIC_EXACT,
+        source_url="official",
+    )
+
+    results = [
+        score_prediction(numeric, "Answer: 1,200"),
+        score_prediction(numeric, "Answer: 999"),
+    ]
+    summary = summarize_scores(results)
+
+    assert summary["accuracy"] == 0.5
+    assert summary["mean_score"] == 0.5
+
+
 def test_mbpp_scoring_requires_explicit_code_execution():
     example = BenchmarkExample(
         benchmark_id="mbpp",
@@ -127,4 +148,3 @@ def test_mbpp_scoring_requires_explicit_code_execution():
 
     assert result.score is None
     assert result.passed is None
-
