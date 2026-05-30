@@ -8,12 +8,66 @@ import re
 import subprocess
 import tempfile
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from tqdm.auto import tqdm
 
 from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind, ScoreResult
+
+
+@dataclass
+class ScoreAccumulator:
+    """Shared aggregate tracker for all benchmark evaluation methods."""
+
+    total: int = 0
+    scored: int = 0
+    passed: int = 0
+    score_total: float = 0.0
+
+    def add(self, result: ScoreResult) -> bool:
+        self.total += 1
+        if result.score is None:
+            return False
+        self.scored += 1
+        self.score_total += float(result.score)
+        if result.passed is True:
+            self.passed += 1
+        return True
+
+    @property
+    def unscored(self) -> int:
+        return self.total - self.scored
+
+    @property
+    def accuracy(self) -> Optional[float]:
+        return self.passed / self.scored if self.scored else None
+
+    @property
+    def mean_score(self) -> Optional[float]:
+        return self.score_total / self.scored if self.scored else None
+
+    def progress_postfix(self) -> Dict[str, Any]:
+        return {
+            "accuracy": format_accuracy(self.accuracy, precision=1),
+            "passed": self.passed,
+            "scored": self.scored,
+        }
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "total": self.total,
+            "scored": self.scored,
+            "unscored": self.unscored,
+            "passed": self.passed,
+            "accuracy": self.accuracy,
+            "mean_score": self.mean_score,
+        }
+
+
+def format_accuracy(value: Optional[float], precision: int = 1) -> str:
+    return "n/a" if value is None else f"{value:.{precision}%}"
 
 
 def score_prediction(
@@ -67,8 +121,7 @@ def score_predictions(
         dynamic_ncols=True,
         disable=not show_progress,
     )
-    scored = 0
-    passed = 0
+    tracker = ScoreAccumulator()
     with progress:
         for example in examples:
             prediction = predictions.get(example.example_id)
@@ -78,35 +131,17 @@ def score_predictions(
                 allow_code_execution=allow_code_execution,
             )
             results.append(result)
-            if result.score is not None:
-                scored += 1
-                if result.passed is True:
-                    passed += 1
-                progress.set_postfix(
-                    scored=scored,
-                    passed=passed,
-                    accuracy=f"{passed / scored:.1%}",
-                    refresh=False,
-                )
+            if tracker.add(result):
+                progress.set_postfix(**tracker.progress_postfix(), refresh=False)
             progress.update(1)
     return results
 
 
 def summarize_scores(results: Sequence[ScoreResult]) -> Dict[str, Any]:
-    scored = [result for result in results if result.score is not None]
-    passed = [result for result in scored if result.passed is True]
-    return {
-        "total": len(results),
-        "scored": len(scored),
-        "unscored": len(results) - len(scored),
-        "passed": len(passed),
-        "accuracy": len(passed) / len(scored) if scored else None,
-        "mean_score": (
-            sum(float(result.score) for result in scored) / len(scored)
-            if scored
-            else None
-        ),
-    }
+    tracker = ScoreAccumulator()
+    for result in results:
+        tracker.add(result)
+    return tracker.summary()
 
 
 def load_normalized_examples(path: Path) -> List[BenchmarkExample]:

@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from tqdm.auto import tqdm
 
 from pact_el.benchmarks.scoring import (
+    ScoreAccumulator,
     load_normalized_examples,
     score_prediction,
     summarize_scores,
@@ -319,8 +320,7 @@ def evaluate_program(
         dynamic_ncols=True,
         disable=not show_progress,
     )
-    scored = 0
-    passed = 0
+    tracker = ScoreAccumulator()
     with progress:
         for example in examples:
             raw_prediction = program(question=example.prompt)
@@ -339,16 +339,8 @@ def evaluate_program(
                 }
             )
             scores.append(score)
-            if score.score is not None:
-                scored += 1
-                if score.passed is True:
-                    passed += 1
-                progress.set_postfix(
-                    scored=scored,
-                    passed=passed,
-                    accuracy=f"{passed / scored:.1%}",
-                    refresh=False,
-                )
+            if tracker.add(score):
+                progress.set_postfix(**tracker.progress_postfix(), refresh=False)
             progress.update(1)
     return predictions, scores
 

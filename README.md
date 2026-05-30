@@ -48,8 +48,10 @@ List the supported official-source benchmarks:
 python3 experiments/prepare_benchmarks.py list
 ```
 
-Benchmark CLIs use `rich` tables and `tqdm` progress bars by default. Add
-`--json` for machine-readable output or `--no-progress` when writing logs.
+Benchmark CLIs use `rich` tables and `tqdm` progress bars by default. Every
+evaluation method reports live `accuracy`, `passed`, and `scored` counts from
+the same scorer. Add `--json` for machine-readable output or `--no-progress`
+when writing logs.
 
 Prepare a normalized JSONL file:
 
