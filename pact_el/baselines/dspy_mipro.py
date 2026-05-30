@@ -11,6 +11,7 @@ import importlib
 import json
 import random
 import statistics
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -129,6 +130,14 @@ class DSPyRunResult:
     predictions_path: Path
     scores_path: Path
     program_path: Optional[Path] = None
+
+
+@dataclass
+class EvaluationStats:
+    """Concurrency stats captured during DSPy final evaluation."""
+
+    requested_workers: int
+    max_in_flight: int = 0
 
 
 def load_examples(path: Path, limit: Optional[int] = None) -> List[BenchmarkExample]:
@@ -343,6 +352,10 @@ def run_dspy_baseline(
         "examples": 0,
         "scored": 0,
     }
+    max_in_flight = max(
+        int(row.get("max_in_flight") or 0)
+        for row in split_results.values()
+    )
 
     program_path: Optional[Path] = None
     program_save_error: Optional[str] = None
@@ -366,6 +379,7 @@ def run_dspy_baseline(
         "train_examples": len(dspy_train),
         "val_examples": len(dspy_val),
         "workers": config.workers,
+        "max_in_flight": max_in_flight,
         "cache": config.cache,
         "num_threads": _effective_num_threads(config),
         "max_metric_calls": config.max_metric_calls,
@@ -555,7 +569,7 @@ def _evaluate_report_splits(
     evaluations: Dict[str, Dict[str, Any]] = {}
     for split_name, examples in split_examples.items():
         before_calls = _lm_history_count(lm)
-        predictions, scores = evaluate_program(
+        predictions, scores, stats = _evaluate_program_with_stats(
             program,
             examples,
             allow_code_execution=allow_code_execution,
@@ -581,6 +595,8 @@ def _evaluate_report_splits(
             "scores_path": str(scores_path),
             "summary": _split_result_summary(scores, examples=len(examples), api_calls=api_calls),
         }
+        evaluations[split_name]["summary"]["workers"] = stats.requested_workers
+        evaluations[split_name]["summary"]["max_in_flight"] = stats.max_in_flight
     return evaluations
 
 
@@ -641,6 +657,27 @@ def evaluate_program(
     workers: int = 1,
     description: str = "DSPy eval",
 ) -> tuple[List[Dict[str, Any]], List[ScoreResult]]:
+    predictions, scores, _stats = _evaluate_program_with_stats(
+        program,
+        examples,
+        allow_code_execution=allow_code_execution,
+        prediction_field=prediction_field,
+        show_progress=show_progress,
+        workers=workers,
+        description=description,
+    )
+    return predictions, scores
+
+
+def _evaluate_program_with_stats(
+    program: Any,
+    examples: Sequence[BenchmarkExample],
+    allow_code_execution: bool = False,
+    prediction_field: str = "answer",
+    show_progress: bool = False,
+    workers: int = 1,
+    description: str = "DSPy eval",
+) -> tuple[List[Dict[str, Any]], List[ScoreResult], EvaluationStats]:
     if workers < 1:
         raise ValueError("workers must be at least 1")
     predictions: List[Optional[Dict[str, Any]]] = [None] * len(examples)
@@ -654,16 +691,41 @@ def evaluate_program(
         disable=not show_progress,
     )
     tracker = ScoreAccumulator()
+    stats = EvaluationStats(requested_workers=workers)
+    active = 0
+    active_lock = threading.Lock()
+
+    def evaluate_tracked(index: int, example: BenchmarkExample) -> Tuple[int, Dict[str, Any], ScoreResult]:
+        nonlocal active
+        with active_lock:
+            active += 1
+            stats.max_in_flight = max(stats.max_in_flight, active)
+        try:
+            return _evaluate_one_program(
+                index,
+                program,
+                example,
+                allow_code_execution=allow_code_execution,
+                prediction_field=prediction_field,
+            )
+        finally:
+            with active_lock:
+                active -= 1
+
+    def active_count() -> int:
+        with active_lock:
+            return active
+
     with progress:
+        progress.set_postfix(
+            workers=workers,
+            in_flight=0,
+            max_in_flight=0,
+            refresh=False,
+        )
         if workers == 1:
             for index, example in enumerate(examples):
-                row, score = _evaluate_one_program(
-                    index,
-                    program,
-                    example,
-                    allow_code_execution=allow_code_execution,
-                    prediction_field=prediction_field,
-                )
+                row, score = evaluate_tracked(index, example)
                 _record_evaluation_result(
                     index,
                     row,
@@ -672,17 +734,17 @@ def evaluate_program(
                     scores,
                     tracker,
                     progress,
+                    workers=workers,
+                    in_flight=active_count(),
+                    max_in_flight=stats.max_in_flight,
                 )
         else:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [
                     executor.submit(
-                        _evaluate_one_program,
+                        evaluate_tracked,
                         index,
-                        program,
                         example,
-                        allow_code_execution=allow_code_execution,
-                        prediction_field=prediction_field,
                     )
                     for index, example in enumerate(examples)
                 ]
@@ -696,10 +758,14 @@ def evaluate_program(
                         scores,
                         tracker,
                         progress,
+                        workers=workers,
+                        in_flight=active_count(),
+                        max_in_flight=stats.max_in_flight,
                     )
     return (
         [prediction for prediction in predictions if prediction is not None],
         [score for score in scores if score is not None],
+        stats,
     )
 
 
@@ -737,11 +803,21 @@ def _record_evaluation_result(
     scores: List[Optional[ScoreResult]],
     tracker: ScoreAccumulator,
     progress: Any,
+    workers: Optional[int] = None,
+    in_flight: Optional[int] = None,
+    max_in_flight: Optional[int] = None,
 ) -> None:
     predictions[index] = prediction
     scores[index] = score
     if tracker.add(score):
-        progress.set_postfix(**tracker.progress_postfix(), refresh=False)
+        postfix = tracker.progress_postfix()
+        if workers is not None:
+            postfix["workers"] = workers
+        if in_flight is not None:
+            postfix["in_flight"] = in_flight
+        if max_in_flight is not None:
+            postfix["max_in_flight"] = max_in_flight
+        progress.set_postfix(**postfix, refresh=False)
     progress.update(1)
 
 

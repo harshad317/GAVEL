@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import sys
+import time
 from types import SimpleNamespace
 
 from pact_el.baselines.dspy_mipro import (
     DSPyMIPROConfig,
+    _evaluate_program_with_stats,
     build_dspy_metric,
     build_gepa_metric,
     run_dspy_baseline,
@@ -46,6 +48,12 @@ class FakeProgram:
         self.saved_path = path
         with open(path, "w") as handle:
             handle.write('{"fake": true}')
+
+
+class SlowProgram(FakeProgram):
+    def __call__(self, **kwargs):
+        time.sleep(0.05)
+        return super().__call__(**kwargs)
 
 
 class FakeMIPROv2:
@@ -176,6 +184,18 @@ def test_direct_dspy_baseline_writes_predictions_and_scores(tmp_path, monkeypatc
     assert result.predictions_path.exists()
     assert result.scores_path.exists()
     assert result.program_path and result.program_path.exists()
+
+
+def test_dspy_evaluation_uses_worker_concurrency():
+    _predictions, _scores, stats = _evaluate_program_with_stats(
+        SlowProgram("question -> answer"),
+        [numeric_example(f"gsm8k:test:{index}") for index in range(6)],
+        workers=3,
+        show_progress=False,
+    )
+
+    assert stats.requested_workers == 3
+    assert stats.max_in_flight == 3
 
 
 def test_mipro_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):

@@ -97,6 +97,7 @@ def print_run_summary(summary: Mapping[str, Any]) -> None:
         "train_examples",
         "val_examples",
         "workers",
+        "max_in_flight",
         "cache",
         "budget",
         "num_threads",

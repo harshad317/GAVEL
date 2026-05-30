@@ -75,6 +75,14 @@ class GavelRunResult:
     prompt_path: Path
 
 
+@dataclass
+class EvaluationStats:
+    """Concurrency stats captured during prompt evaluation."""
+
+    requested_workers: int
+    max_in_flight: int = 0
+
+
 async def run_gavel_baseline(
     *,
     train_examples: Sequence[BenchmarkExample],
@@ -108,7 +116,7 @@ async def run_gavel_baseline(
             DiskJsonCache(cache_dir / "target.json"),
         )
 
-    evidence_predictions, evidence_scores = await evaluate_prompt(
+    evidence_predictions, evidence_scores, evidence_stats = await evaluate_prompt(
         prompt=base_prompt,
         examples=train_examples,
         target_client=target_client,
@@ -165,7 +173,16 @@ async def run_gavel_baseline(
         "api_calls": optimization_api_calls,
         "examples": len(train_examples),
         "scored": len([score for score in evidence_scores if score.score is not None]),
+        "workers": evidence_stats.requested_workers,
+        "max_in_flight": evidence_stats.max_in_flight,
     }
+    max_in_flight = max(
+        [evidence_stats.max_in_flight]
+        + [
+            int(split_eval["summary"].get("max_in_flight") or 0)
+            for split_eval in split_evaluations.values()
+        ]
+    )
     summary = {
         **summarize_scores(scores),
         "method": "gavel",
@@ -178,6 +195,7 @@ async def run_gavel_baseline(
         "train_examples": len(train_examples),
         "val_examples": len(val_examples),
         "workers": config.workers,
+        "max_in_flight": max_in_flight,
         "cache": config.cache,
         "budget": config.budget,
         "accepted": report.accepted,
@@ -220,7 +238,7 @@ async def evaluate_prompt(
     workers: int,
     description: str,
     phase: str,
-) -> tuple[List[Dict[str, Any]], List[ScoreResult]]:
+) -> tuple[List[Dict[str, Any]], List[ScoreResult], EvaluationStats]:
     if workers < 1:
         raise ValueError("workers must be at least 1")
     predictions: List[Optional[Dict[str, Any]]] = [None] * len(examples)
@@ -234,19 +252,36 @@ async def evaluate_prompt(
         disable=not show_progress,
     )
     tracker = ScoreAccumulator()
+    stats = EvaluationStats(requested_workers=workers)
+    active = 0
+    active_lock = asyncio.Lock()
     semaphore = asyncio.Semaphore(workers)
 
     async def run_one(index: int, example: BenchmarkExample) -> Tuple[int, Dict[str, Any], ScoreResult]:
         async with semaphore:
-            response = await target_client.complete(
-                prompt,
-                example.prompt,
-                metadata={
-                    "phase": phase,
-                    "example_id": example.example_id,
-                    "benchmark_id": example.benchmark_id,
-                },
-            )
+            nonlocal active
+            async with active_lock:
+                active += 1
+                stats.max_in_flight = max(stats.max_in_flight, active)
+                progress.set_postfix(
+                    workers=workers,
+                    in_flight=active,
+                    max_in_flight=stats.max_in_flight,
+                    refresh=False,
+                )
+            try:
+                response = await target_client.complete(
+                    prompt,
+                    example.prompt,
+                    metadata={
+                        "phase": phase,
+                        "example_id": example.example_id,
+                        "benchmark_id": example.benchmark_id,
+                    },
+                )
+            finally:
+                async with active_lock:
+                    active -= 1
             prediction = "" if response.output is None else str(response.output)
             score = score_prediction(
                 example,
@@ -265,6 +300,12 @@ async def evaluate_prompt(
             )
 
     with progress:
+        progress.set_postfix(
+            workers=workers,
+            in_flight=0,
+            max_in_flight=0,
+            refresh=False,
+        )
         tasks = [
             asyncio.create_task(run_one(index, example))
             for index, example in enumerate(examples)
@@ -274,11 +315,18 @@ async def evaluate_prompt(
             predictions[index] = prediction
             scores[index] = score
             if tracker.add(score):
-                progress.set_postfix(**tracker.progress_postfix(), refresh=False)
+                progress.set_postfix(
+                    **tracker.progress_postfix(),
+                    workers=workers,
+                    in_flight=active,
+                    max_in_flight=stats.max_in_flight,
+                    refresh=False,
+                )
             progress.update(1)
     return (
         [prediction for prediction in predictions if prediction is not None],
         [score for score in scores if score is not None],
+        stats,
     )
 
 
@@ -439,7 +487,7 @@ async def _evaluate_report_splits(
     }
     evaluations: Dict[str, Dict[str, Any]] = {}
     for split_name, examples in split_examples.items():
-        predictions, scores = await evaluate_prompt(
+        predictions, scores, stats = await evaluate_prompt(
             prompt=prompt,
             examples=examples,
             target_client=target_client,
@@ -465,6 +513,7 @@ async def _evaluate_report_splits(
                 scores,
                 examples=len(examples),
                 api_calls=len(examples),
+                stats=stats,
             ),
         }
     return evaluations
@@ -596,6 +645,7 @@ def _split_result_summary(
     *,
     examples: int,
     api_calls: Optional[int],
+    stats: Optional[EvaluationStats] = None,
 ) -> Dict[str, Any]:
     score_values = [float(score.score) for score in scores if score.score is not None]
     summary = summarize_scores(scores)
@@ -608,6 +658,8 @@ def _split_result_summary(
         "scored": summary["scored"],
         "passed": summary["passed"],
         "unscored": summary["unscored"],
+        "workers": None if stats is None else stats.requested_workers,
+        "max_in_flight": None if stats is None else stats.max_in_flight,
     }
 
 

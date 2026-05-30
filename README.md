@@ -62,8 +62,9 @@ python3 experiments/prepare_benchmarks.py list
 
 Benchmark CLIs use `rich` tables and `tqdm` progress bars by default. Every
 evaluation method reports live `accuracy`, `passed`, and `scored` counts from
-the same scorer. Add `--json` for machine-readable output or `--no-progress`
-when writing logs.
+the same scorer. Parallel evaluators also display `in_flight` and
+`max_in_flight` so `--workers` behavior is visible. Add `--json` for
+machine-readable output or `--no-progress` when writing logs.
 
 Prepare a normalized JSONL file:
 

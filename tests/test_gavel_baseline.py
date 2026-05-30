@@ -4,8 +4,14 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
 import pytest
+import asyncio
 
-from pact_el.baselines.gavel import GavelConfig, default_base_prompt, run_gavel_baseline
+from pact_el.baselines.gavel import (
+    GavelConfig,
+    default_base_prompt,
+    evaluate_prompt,
+    run_gavel_baseline,
+)
 from pact_el.benchmarks.schemas import BenchmarkExample, BenchmarkSpec, BenchmarkTaskType, MetricKind
 from pact_el.clients import ClientResponse
 from pact_el.schemas import CallRecord, CallRole
@@ -57,6 +63,17 @@ class FakeTargetClient:
             raw=output,
             call_record=_record(CallRole.TARGET, "target_complete", metadata),
         )
+
+
+class SlowTargetClient(FakeTargetClient):
+    async def complete(
+        self,
+        prompt: str,
+        input: Any,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ClientResponse:
+        await asyncio.sleep(0.05)
+        return await super().complete(prompt, input, metadata=metadata)
 
 
 def _record(
@@ -140,3 +157,22 @@ def test_default_base_prompt_is_benchmark_specific():
     prompt = default_base_prompt(_spec())
     assert "benchmark-solving" in prompt
     assert "final answer" in prompt
+
+
+@pytest.mark.asyncio
+async def test_gavel_evaluation_uses_worker_concurrency():
+    examples = [_numeric_example(f"gsm8k:test:{index}") for index in range(6)]
+
+    _predictions, _scores, stats = await evaluate_prompt(
+        prompt="answer",
+        examples=examples,
+        target_client=SlowTargetClient(),
+        allow_code_execution=False,
+        show_progress=False,
+        workers=3,
+        description="test",
+        phase="test",
+    )
+
+    assert stats.requested_workers == 3
+    assert stats.max_in_flight == 3
