@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pact-el"
+version = "0.1.0"
+description = "PACT-EL/GAVEL: guarantee-aware prompt contract repair with executable logic and canary falsification."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "PACT-EL contributors" }]
+dependencies = [
+  "jsonschema>=4.20,<5",
+  "networkx>=3.2,<4",
+  "pydantic>=2.6,<3",
+  "typing-extensions>=4.8",
+]
+
+[project.optional-dependencies]
+litellm = ["litellm>=1.40"]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools.packages.find]
+include = ["pact_el*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
