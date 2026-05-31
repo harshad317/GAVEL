@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 import copy
 import importlib
+import importlib.metadata as importlib_metadata
+import sys
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -21,6 +23,23 @@ from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind, ScoreResult
 
 IFBENCH_EVALUATOR_MISSING_REASON = "official IFBench evaluator is not installed"
 IFBENCH_INSTALL_COMMAND = "python -m pip install -e '.[ifbench]'"
+IFBENCH_EVALUATOR_MODULES = ("evaluation_lib", "ifbench.evaluation_lib")
+
+
+class MissingIFBenchEvaluatorError(ModuleNotFoundError):
+    """Raised when none of the known IFBench evaluator import paths are available."""
+
+    def __init__(self, attempted_modules: Sequence[Mapping[str, str]]) -> None:
+        self.attempted_modules = [dict(attempt) for attempt in attempted_modules]
+        missing_module = (
+            self.attempted_modules[0].get("missing_module")
+            if self.attempted_modules
+            else "evaluation_lib"
+        )
+        super().__init__(
+            "No known IFBench evaluator module could be imported",
+            name=missing_module,
+        )
 
 
 @dataclass
@@ -430,10 +449,22 @@ def _score_ifbench_official(example: BenchmarkExample, prediction: Any) -> Score
 
 
 def _import_ifbench_evaluation_lib() -> Any:
-    try:
-        return importlib.import_module("evaluation_lib")
-    except ModuleNotFoundError:
-        return importlib.import_module("ifbench.evaluation_lib")
+    attempted_modules: List[Dict[str, str]] = []
+    for module_name in IFBENCH_EVALUATOR_MODULES:
+        try:
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if not _missing_requested_module(exc, module_name):
+                raise
+            attempted_modules.append(
+                {"module": module_name, "missing_module": str(exc.name or module_name)}
+            )
+
+    distribution_module = _import_ifbench_evaluator_from_distribution()
+    if distribution_module is not None:
+        return distribution_module
+
+    raise MissingIFBenchEvaluatorError(attempted_modules)
 
 
 def ifbench_evaluator_missing_details() -> Optional[Dict[str, Any]]:
@@ -445,11 +476,40 @@ def ifbench_evaluator_missing_details() -> Optional[Dict[str, Any]]:
 
 
 def _missing_ifbench_evaluator_details(exc: ModuleNotFoundError) -> Dict[str, Any]:
-    return {
+    details: Dict[str, Any] = {
         "reason": IFBENCH_EVALUATOR_MISSING_REASON,
         "install": IFBENCH_INSTALL_COMMAND,
         "missing_module": exc.name,
     }
+    attempted_modules = getattr(exc, "attempted_modules", None)
+    if attempted_modules:
+        details["attempted_modules"] = attempted_modules
+    return details
+
+
+def _missing_requested_module(exc: ModuleNotFoundError, module_name: str) -> bool:
+    missing_name = exc.name
+    return bool(
+        missing_name
+        and (missing_name == module_name or module_name.startswith(f"{missing_name}."))
+    )
+
+
+def _import_ifbench_evaluator_from_distribution() -> Optional[Any]:
+    try:
+        distribution = importlib_metadata.distribution("ifbench")
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+    for file in distribution.files or ():
+        if Path(str(file)).name != "evaluation_lib.py":
+            continue
+        evaluator_path = Path(distribution.locate_file(file))
+        evaluator_dir = str(evaluator_path.parent)
+        if evaluator_dir not in sys.path:
+            sys.path.insert(0, evaluator_dir)
+        return importlib.import_module("evaluation_lib")
+    return None
 
 
 def extract_choice(prediction: str, choices: Sequence[str]) -> Optional[str]:

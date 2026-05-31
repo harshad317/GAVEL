@@ -5,6 +5,9 @@ import json
 import sys
 from types import SimpleNamespace
 
+import pytest
+
+from pact_el.benchmarks import scoring as scoring_module
 from pact_el.benchmarks.adapters import (
     drop_answer_to_strings,
     extract_gsm8k_answer,
@@ -308,6 +311,50 @@ def test_ifbench_official_evaluator_metric_uses_installed_verifier(monkeypatch):
     assert result.passed is True
     assert result.score == 1.0
     assert result.details["evaluator"] == "allenai/IFBench test_instruction_following_loose"
+
+
+def test_ifbench_evaluator_missing_details_reports_attempted_imports(monkeypatch):
+    def fake_import_module(module_name):
+        if module_name == "evaluation_lib":
+            raise ModuleNotFoundError("No module named 'evaluation_lib'", name="evaluation_lib")
+        if module_name == "ifbench.evaluation_lib":
+            raise ModuleNotFoundError("No module named 'ifbench'", name="ifbench")
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    def missing_distribution(_name):
+        raise scoring_module.importlib_metadata.PackageNotFoundError
+
+    monkeypatch.setattr(scoring_module.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(scoring_module.importlib_metadata, "distribution", missing_distribution)
+
+    details = scoring_module.ifbench_evaluator_missing_details()
+
+    assert details == {
+        "reason": "official IFBench evaluator is not installed",
+        "install": "python -m pip install -e '.[ifbench]'",
+        "missing_module": "evaluation_lib",
+        "attempted_modules": [
+            {"module": "evaluation_lib", "missing_module": "evaluation_lib"},
+            {"module": "ifbench.evaluation_lib", "missing_module": "ifbench"},
+        ],
+    }
+
+
+def test_ifbench_evaluator_import_does_not_hide_nested_import_errors(monkeypatch):
+    def fake_import_module(module_name):
+        if module_name == "evaluation_lib":
+            raise ModuleNotFoundError(
+                "No module named 'instructions_registry'",
+                name="instructions_registry",
+            )
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    monkeypatch.setattr(scoring_module.importlib, "import_module", fake_import_module)
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        scoring_module._import_ifbench_evaluation_lib()
+
+    assert exc_info.value.name == "instructions_registry"
 
 
 def test_mbpp_scoring_requires_explicit_code_execution():
