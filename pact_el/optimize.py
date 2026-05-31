@@ -65,14 +65,21 @@ async def pact_optimize(
         )
 
     compiler = ContractCompiler(optimizer_client)
-    compiled = await compiler.compile(
-        prompt=prompt,
-        task_spec=task_spec,
-        rubric=rubric,
-        ledger=ledger,
-        call_ledger=call_ledger,
-        budget=budget,
-    )
+    try:
+        compiled = await compiler.compile(
+            prompt=prompt,
+            task_spec=task_spec,
+            rubric=rubric,
+            ledger=ledger,
+            call_ledger=call_ledger,
+            budget=budget,
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        return _compile_schema_failure_report(
+            prompt=prompt,
+            call_ledger=call_ledger,
+            exc=exc,
+        )
 
     rendered_prompt = render_prompt(
         compiled.graph,
@@ -315,6 +322,49 @@ def _repair_schema_failure_report(
                 "type": type(exc).__name__,
                 "message": str(exc),
                 "failed_canary_ids": failed_ids,
+            }
+        },
+    )
+
+
+def _compile_schema_failure_report(
+    *,
+    prompt: str,
+    call_ledger: CallLedger,
+    exc: Exception,
+) -> OptimizationReport:
+    reason = (
+        "optimizer compiler output did not match the CompilerOutput schema; "
+        "falling back without applying a compiled patch"
+    )
+    diagnosis = NoPatchDiagnosis(
+        reason=reason,
+        evidence_ids=[],
+        recommended_owner="prompt",
+        confidence=0.55,
+        metadata={
+            "compile_error_type": type(exc).__name__,
+            "compile_error": str(exc),
+        },
+    )
+    return OptimizationReport(
+        original_prompt=prompt,
+        rendered_prompt=prompt,
+        accepted=False,
+        decision=GateDecision.REJECTED_NO_PATCH,
+        graph=None,
+        defect_posterior=[],
+        patch=None,
+        canaries=[],
+        canary_results=[],
+        call_ledger=call_ledger,
+        deterministic_validator_passed=False,
+        no_patch_diagnosis=diagnosis,
+        notes=[reason, str(exc)],
+        metadata={
+            "compile_schema_error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
             }
         },
     )
