@@ -953,7 +953,12 @@ def constraint_solver_prompt(spec: Optional[BenchmarkSpec] = None) -> str:
                 "For exact word counts or ranges, draft with short common words and count the final visible words only.",
                 "For unique-word constraints, avoid reusing any content word and check case-insensitively.",
                 "For keyword-position constraints, place the required word first, last, or at the requested index before drafting surrounding text.",
-                "For vowel, consonant, syllable, palindrome, alphabet, first-letter, last-letter, or word-length constraints, select candidate words deliberately and discard any uncertain word.",
+                "For vowel constraints, screen each candidate word by its first or last letter: vowels are a, e, i, o, u only.",
+                "For consonant constraints, count non-vowel letters (b,c,d,f,g,h,j,k,l,m,n,p,q,r,s,t,v,w,x,y,z) per word letter-by-letter before selecting it.",
+                "For syllable odd/even constraints, count vowel clusters per word (each consecutive vowel run = one syllable), then check parity; do not rely on intuition alone.",
+                "For prime word-length constraints, the prime lengths ≤ 15 are exactly 2, 3, 5, 7, 11, 13; reject words whose character count is not in this set.",
+                "For last-word-to-first-word chaining across sentences or paragraphs, write the boundary words for every unit first, then fill the interior content.",
+                "For overlap or balance ratio constraints, tally shared words or sentence types in your draft numerically and revise until the ratio is satisfied.",
                 "For repeated-span constraints, create the exact span once, copy it the requested number of times, then apply only the allowed changes.",
                 "For no-whitespace, indentation, quote, title-case, option, punctuation, or bracket constraints, verify the final visible characters exactly.",
             ],
@@ -1073,9 +1078,14 @@ def _default_prompt_sections(
         output_format.append("Put the final result on its own final line as `Answer: <answer>`.")
     elif task_type == BenchmarkTaskType.INSTRUCTION_FOLLOWING:
         constraints.append("Satisfy every explicit output constraint, including counts, casing, delimiters, required words, forbidden words, and ordering.")
-        task.append("Privately convert the instruction into a checklist; treat word, sentence, line, ratio, repetition, and position constraints as hard requirements.")
-        task.append("For count or ratio constraints, choose a simple structure that makes counting easy, then revise until the requested counts and proportions are exact.")
-        task.append("For word-property constraints such as vowels, consonants, syllables, first/last letters, alphabetical order, or repeated spans, use only words you can verify against that property.")
+        task.append("Privately enumerate every measurable constraint before drafting: word/sentence/line counts, ratios, required words, forbidden words, casing, delimiters, and word-property rules.")
+        task.append("For count or ratio constraints, decide the exact target value first, choose a simple output skeleton, then count your draft and revise until exact.")
+        task.append("For vowel/consonant constraints: vowels are {a, e, i, o, u}; consonants are all other letters. Count letter-by-letter for each candidate word before committing to it.")
+        task.append("For syllable odd/even constraints: count syllables by counting distinct vowel clusters in a word (each consecutive run of vowels = one syllable). Odd = 1,3,5,...; even = 2,4,6,... Verify parity per word.")
+        task.append("For prime word-length constraints: prime character counts ≤ 15 are 2, 3, 5, 7, 11, 13. Non-prime: 1, 4, 6, 8, 9, 10, 12, 14, 15. Check each required word's length explicitly.")
+        task.append("For last-word-to-first-word chaining across sentences or paragraphs: plan the full chain of boundary words before writing any content, then fill each unit around that skeleton.")
+        task.append("For ratio or overlap constraints: after drafting, compute the ratio numerically—count shared words between sections or sentence-type distributions—and adjust the draft until the ratio matches.")
+        task.append("For keyword-in-every-sentence or keyword-at-position constraints: write each sentence starting from the required keyword rather than inserting it afterward.")
         output_format.append("For formatting constraints such as quotes, indentation, options, title case, whitespace, newlines, bullets, or emoji, make the final answer match the requested surface form exactly.")
     elif task_type == BenchmarkTaskType.MULTIPLE_CHOICE:
         task.append("Select the single best answer choice.")
@@ -1231,12 +1241,24 @@ def _metric_strategy_items(metrics: Sequence[Any]) -> List[str]:
 
 def _instruction_family_strategy_items(family_counts: Counter[str]) -> List[str]:
     strategy_by_family = {
-        "words": "for word-property constraints, use words whose spelling, vowels, consonants, syllables, first letters, and last letters are easy to verify",
-        "count": "for count constraints, decide the exact number of words, lines, list items, or occurrences before writing",
-        "ratio": "for ratio constraints, use a simple repeated structure and verify each side of the ratio explicitly",
-        "sentence": "for sentence constraints, construct and verify one sentence at a time before joining the answer",
+        "words": (
+            "for word-property constraints, verify each property mechanically before choosing a word: "
+            "(a) vowel start/end = first or last letter in {a,e,i,o,u}; "
+            "(b) consonant count = count every letter that is NOT a,e,i,o,u; "
+            "(c) syllable odd/even = count vowel clusters per word (each consecutive vowel run = one syllable), then check parity; "
+            "(d) prime word length = character count must be in {2,3,5,7,11,13}; "
+            "(e) last-first chaining = the exact last word of one sentence/paragraph must be the exact first word of the next"
+        ),
+        "count": "for count constraints, decide the exact number of words, lines, list items, or occurrences before writing, then count the draft and adjust",
+        "ratio": (
+            "for ratio constraints, compute the ratio numerically after drafting: "
+            "for overlap ratios count shared content words between sections; "
+            "for sentence-type balance count each type (declarative, interrogative, exclamatory); "
+            "for word-per-sentence ratios count words per sentence and verify the required proportion"
+        ),
+        "sentence": "for sentence constraints, construct and verify one sentence at a time—check required keywords, punctuation, alliteration, length, or ordering before moving on",
         "format": "for format constraints, match requested delimiters, casing, whitespace, bullets, quotes, and line breaks exactly",
-        "repeat": "for repetition constraints, count each required repeated word, phrase, or span after drafting",
+        "repeat": "for repetition constraints, create the exact span once, copy it the required number of times, then apply only the allowed modifications",
         "custom": "for custom transformations, perform the requested transformation literally and avoid paraphrasing it away",
         "keywords": "for keyword constraints, include required keywords exactly and remove forbidden keywords completely",
         "language": "for language constraints, keep the entire final answer in the requested language",

@@ -54,7 +54,6 @@ async def test_pact_optimize_returns_no_patch_when_repair_schema_is_invalid(
             "graph_edits": [
                 {
                     "operation": "update_node",
-                    "node_id": "task",
                 }
             ],
         },
@@ -108,7 +107,6 @@ async def test_pact_optimize_returns_no_patch_when_compile_schema_is_invalid(
     compiler_payload["patch"]["graph_edits"] = [
         {
             "operation": "update_node",
-            "node_id": "task",
         }
     ]
 

@@ -303,7 +303,7 @@ class AxiomEdit(StrictModel):
     guarantee_id: Optional[str] = None
     before: Optional[Any] = None
     after: Optional[Any] = None
-    rationale: str
+    rationale: str = ""
 
     @model_validator(mode="after")
     def _operation_has_target(self) -> "AxiomEdit":
