@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import copy
+import inspect
 import importlib
 import importlib.metadata as importlib_metadata
 import sys
@@ -426,7 +427,11 @@ def _score_ifbench_official(example: BenchmarkExample, prediction: Any) -> Score
         key=row.get("key"),
         instruction_id_list=list(row.get("instruction_id_list") or []),
         prompt=str(row.get("prompt", example.prompt)),
-        kwargs=copy.deepcopy(list(row.get("kwargs") or [])),
+        kwargs=_sanitize_ifbench_kwargs(
+            evaluation_lib,
+            list(row.get("instruction_id_list") or []),
+            copy.deepcopy(list(row.get("kwargs") or [])),
+        ),
     )
     output = evaluation_lib.test_instruction_following_loose(
         inp,
@@ -446,6 +451,57 @@ def _score_ifbench_official(example: BenchmarkExample, prediction: Any) -> Score
             "follow_instruction_list": list(output.follow_instruction_list),
         },
     )
+
+
+def _sanitize_ifbench_kwargs(
+    evaluation_lib: Any,
+    instruction_id_list: Sequence[str],
+    kwargs_list: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    registry = getattr(evaluation_lib, "instructions_registry", None)
+    instruction_dict = getattr(registry, "INSTRUCTION_DICT", {})
+    sanitized: List[Dict[str, Any]] = []
+
+    for index, instruction_id in enumerate(instruction_id_list):
+        raw_kwargs = dict(kwargs_list[index]) if index < len(kwargs_list) else {}
+        raw_kwargs = {key: value for key, value in raw_kwargs.items() if value is not None}
+        instruction_cls = instruction_dict.get(instruction_id)
+        if instruction_cls is None:
+            sanitized.append(raw_kwargs)
+            continue
+
+        build_description = getattr(instruction_cls, "build_description", None)
+        if build_description is None:
+            sanitized.append(raw_kwargs)
+            continue
+
+        signature = inspect.signature(build_description)
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            sanitized.append(raw_kwargs)
+            continue
+
+        accepted = {
+            name
+            for name, parameter in signature.parameters.items()
+            if name != "self"
+            and parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        }
+        sanitized.append(
+            {
+                key: value
+                for key, value in raw_kwargs.items()
+                if key in accepted
+            }
+        )
+
+    return sanitized
 
 
 def _import_ifbench_evaluation_lib() -> Any:

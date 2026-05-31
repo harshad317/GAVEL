@@ -25,6 +25,7 @@ from pact_el.benchmarks.scoring import (
     score_predictions,
     summarize_scores,
     summarize_unscored_reasons,
+    _sanitize_ifbench_kwargs,
 )
 from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind, ScoreResult
 
@@ -329,6 +330,48 @@ def test_ifbench_official_evaluator_metric_uses_installed_verifier(monkeypatch):
     assert result.passed is True
     assert result.score == 1.0
     assert result.details["evaluator"] == "allenai/IFBench test_instruction_following_loose"
+
+
+def test_ifbench_kwargs_are_sanitized_for_checker_signature():
+    class NoArgChecker:
+        def build_description(self):
+            pass
+
+    class SepChecker:
+        def build_description(self, *, sep=None):
+            pass
+
+    class AnyKwargsChecker:
+        def build_description(self, **kwargs):
+            pass
+
+    fake_evaluator = SimpleNamespace(
+        instructions_registry=SimpleNamespace(
+            INSTRUCTION_DICT={
+                "format:no_whitespace": NoArgChecker,
+                "format:list": SepChecker,
+                "custom:any": AnyKwargsChecker,
+            }
+        )
+    )
+
+    sanitized = _sanitize_ifbench_kwargs(
+        fake_evaluator,
+        ["format:no_whitespace", "format:list", "custom:any", "unknown:id"],
+        [
+            {"N": None, "sep": "DROP"},
+            {"N": None, "sep": "SEPARATOR", "capital_frequency": None},
+            {"N": 5, "unused": None},
+            {"N": 1, "unused": None},
+        ],
+    )
+
+    assert sanitized == [
+        {},
+        {"sep": "SEPARATOR"},
+        {"N": 5},
+        {"N": 1},
+    ]
 
 
 def test_ifbench_evaluator_missing_details_reports_attempted_imports(monkeypatch):
