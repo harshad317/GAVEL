@@ -740,11 +740,12 @@ def _evaluate_program_with_stats(
             return active
 
     with progress:
-        progress.set_postfix(
+        _set_progress_postfix(
+            progress,
+            tracker,
             workers=workers,
             in_flight=0,
             max_in_flight=0,
-            refresh=False,
         )
         if workers == 1:
             for index, example in enumerate(examples):
@@ -832,16 +833,33 @@ def _record_evaluation_result(
 ) -> None:
     predictions[index] = prediction
     scores[index] = score
-    if tracker.add(score):
-        postfix = tracker.progress_postfix()
-        if workers is not None:
-            postfix["workers"] = workers
-        if in_flight is not None:
-            postfix["in_flight"] = in_flight
-        if max_in_flight is not None:
-            postfix["max_in_flight"] = max_in_flight
-        progress.set_postfix(**postfix, refresh=False)
+    tracker.add(score)
+    _set_progress_postfix(
+        progress,
+        tracker,
+        workers=workers,
+        in_flight=in_flight,
+        max_in_flight=max_in_flight,
+    )
     progress.update(1)
+
+
+def _set_progress_postfix(
+    progress: Any,
+    tracker: ScoreAccumulator,
+    *,
+    workers: Optional[int] = None,
+    in_flight: Optional[int] = None,
+    max_in_flight: Optional[int] = None,
+) -> None:
+    postfix = tracker.progress_postfix()
+    if workers is not None:
+        postfix["workers"] = workers
+    if in_flight is not None:
+        postfix["in_flight"] = in_flight
+    if max_in_flight is not None:
+        postfix["max_in_flight"] = max_in_flight
+    progress.set_postfix(**postfix, refresh=False)
 
 
 def _to_dspy_example(dspy: Any, example: BenchmarkExample) -> Any:

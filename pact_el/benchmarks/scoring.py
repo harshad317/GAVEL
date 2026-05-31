@@ -53,9 +53,11 @@ class ScoreAccumulator:
 
     def progress_postfix(self) -> Dict[str, Any]:
         return {
-            "accuracy": format_accuracy(self.accuracy, precision=1),
+            "acc": format_accuracy(self.accuracy, precision=1),
+            "mean": format_mean_score(self.mean_score),
             "passed": self.passed,
             "scored": self.scored,
+            "unscored": self.unscored,
         }
 
     def summary(self) -> Dict[str, Any]:
@@ -71,6 +73,10 @@ class ScoreAccumulator:
 
 def format_accuracy(value: Optional[float], precision: int = 1) -> str:
     return "n/a" if value is None else f"{value:.{precision}%}"
+
+
+def format_mean_score(value: Optional[float], precision: int = 3) -> str:
+    return "n/a" if value is None else f"{value:.{precision}f}"
 
 
 def _validate_workers(workers: int) -> int:
@@ -180,8 +186,8 @@ def _record_score_result(
     progress: Any,
 ) -> None:
     results[index] = result
-    if tracker.add(result):
-        progress.set_postfix(**tracker.progress_postfix(), refresh=False)
+    tracker.add(result)
+    progress.set_postfix(**tracker.progress_postfix(), refresh=False)
     progress.update(1)
 
 

@@ -267,11 +267,12 @@ async def evaluate_prompt(
             async with active_lock:
                 active += 1
                 stats.max_in_flight = max(stats.max_in_flight, active)
-                progress.set_postfix(
+                _set_progress_postfix(
+                    progress,
+                    tracker,
                     workers=workers,
                     in_flight=active,
                     max_in_flight=stats.max_in_flight,
-                    refresh=False,
                 )
             try:
                 response = await target_client.complete(
@@ -304,11 +305,12 @@ async def evaluate_prompt(
             )
 
     with progress:
-        progress.set_postfix(
+        _set_progress_postfix(
+            progress,
+            tracker,
             workers=workers,
             in_flight=0,
             max_in_flight=0,
-            refresh=False,
         )
         tasks = [
             asyncio.create_task(run_one(index, example))
@@ -318,20 +320,38 @@ async def evaluate_prompt(
             index, prediction, score = await task
             predictions[index] = prediction
             scores[index] = score
-            if tracker.add(score):
-                progress.set_postfix(
-                    **tracker.progress_postfix(),
-                    workers=workers,
-                    in_flight=active,
-                    max_in_flight=stats.max_in_flight,
-                    refresh=False,
-                )
+            tracker.add(score)
+            _set_progress_postfix(
+                progress,
+                tracker,
+                workers=workers,
+                in_flight=active,
+                max_in_flight=stats.max_in_flight,
+            )
             progress.update(1)
     return (
         [prediction for prediction in predictions if prediction is not None],
         [score for score in scores if score is not None],
         stats,
     )
+
+
+def _set_progress_postfix(
+    progress: Any,
+    tracker: ScoreAccumulator,
+    *,
+    workers: Optional[int],
+    in_flight: Optional[int],
+    max_in_flight: Optional[int],
+) -> None:
+    postfix = tracker.progress_postfix()
+    if workers is not None:
+        postfix["workers"] = workers
+    if in_flight is not None:
+        postfix["in_flight"] = in_flight
+    if max_in_flight is not None:
+        postfix["max_in_flight"] = max_in_flight
+    progress.set_postfix(**postfix, refresh=False)
 
 
 def default_base_prompt(spec: Optional[BenchmarkSpec] = None) -> str:

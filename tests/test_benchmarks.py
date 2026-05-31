@@ -14,11 +14,12 @@ from pact_el.benchmarks.registry import get_benchmark_spec, list_benchmarks
 from pact_el.benchmarks.scoring import (
     ScoreAccumulator,
     format_accuracy,
+    format_mean_score,
     score_prediction,
     score_predictions,
     summarize_scores,
 )
-from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind
+from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind, ScoreResult
 
 
 def test_registry_contains_requested_official_benchmarks():
@@ -157,11 +158,38 @@ def test_score_accumulator_gives_every_method_the_same_accuracy_postfix():
 
     assert tracker.summary()["accuracy"] == 0.5
     assert tracker.progress_postfix() == {
-        "accuracy": "50.0%",
+        "acc": "50.0%",
+        "mean": "0.500",
         "passed": 1,
         "scored": 2,
+        "unscored": 0,
     }
     assert format_accuracy(tracker.accuracy, precision=2) == "50.00%"
+    assert format_mean_score(tracker.mean_score) == "0.500"
+
+
+def test_score_accumulator_postfix_reports_unscored_progress():
+    tracker = ScoreAccumulator()
+
+    tracker.add(
+        ScoreResult(
+            example_id="ifbench:test:0",
+            metric=MetricKind.OFFICIAL_EVALUATOR,
+            score=None,
+            passed=None,
+            prediction="",
+            expected=None,
+            details={"reason": "official evaluator is not installed"},
+        )
+    )
+
+    assert tracker.progress_postfix() == {
+        "acc": "n/a",
+        "mean": "n/a",
+        "passed": 0,
+        "scored": 0,
+        "unscored": 1,
+    }
 
 
 def test_score_predictions_can_use_process_workers():
