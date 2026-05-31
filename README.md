@@ -242,16 +242,21 @@ validation-scores a prompt portfolio before final evaluation. The default
 portfolio contains a benchmark-general task strategy prompt, a stricter
 constraint-solver prompt, an aggregate evidence strategy prompt when train
 failures expose recurring patterns, and the compiled GAVEL candidate. The
-held-out validation gate selects the best non-base prompt only when it clears
-the base validation score by a confidence-aware effective margin. Canary-
-rejected and much longer prompts need extra validation lift before they can be
-selected, which reduces narrow prompt overfit. Use
+held-out validation gate selects across both prompt variants and target
+execution modes. By default it compares direct answering, label-free
+self-refinement, and a label-free plan-and-answer mode that first compiles the
+current user prompt into a task contract and then produces the final answer
+from that contract. A non-base prompt or non-direct execution mode is used only
+when it clears the base direct validation score by a confidence-aware effective
+margin. Canary-rejected and much longer prompts need extra validation lift
+before they can be selected, which reduces narrow prompt overfit. Use
 `--disable-rejected-candidate-validation` for stricter canary-only ablations,
 or `--disable-prompt-portfolio` to score only the compiled candidate. The
-runner then evaluates the selected prompt on train, validation, and test using
-an optional label-free self-refinement pass (`--self-refine-rounds`, default
-`1`). It writes prediction JSONL, score JSONL, the full GAVEL optimization
-report, the selected prompt, and a summary JSON.
+runner then evaluates the selected prompt and execution mode on train,
+validation, and test. Use `--execution-modes direct,plan,self_refine` to control
+the validation portfolio and `--self-refine-rounds` to set the depth of the
+self-refinement mode. It writes prediction JSONL, score JSONL, the full GAVEL
+optimization report, the selected prompt, and a summary JSON.
 
 Base prompts and graph-rendered GAVEL prompts use the same compact structured
 prompt frame: `Goal`, `Context`, `Role`, `Input`, `Task`, `Constraints`,
@@ -281,7 +286,7 @@ prompt frame: `Goal`, `Context`, `Role`, `Input`, `Task`, `Constraints`,
 
 - The rendered prompt is derived from the Prompt Axiom Graph and GuaranteeScript, not copied from a freeform optimizer rewrite.
 - Runtime prompts use a compact eight-section structure: Goal, Context, Role, Input, Task, Constraints, Output Format, and Quality Bar.
-- Live GAVEL selection compares a small portfolio of structured prompts against the base prompt on held-out validation before test evaluation.
+- Live GAVEL selection compares a small portfolio of structured prompts and label-free execution modes against the base direct run on held-out validation before test evaluation.
 - Validation selection uses statistical, canary-rejection, and prompt-complexity margins so small validation wins do not automatically select brittle prompts.
 - Runtime compiled graph clauses are conditional on the current user input; evidence-specific constraints must not become unconditional requirements for unrelated examples.
 - Optimizer output must satisfy a strict JSON schema on the first parse. Markdown-fenced or repaired JSON is rejected.

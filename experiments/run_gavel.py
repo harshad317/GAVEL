@@ -133,6 +133,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Label-free target-model draft repair rounds per evaluated example.",
     )
+    parser.add_argument(
+        "--execution-modes",
+        default="direct,plan,self_refine",
+        help=(
+            "Comma-separated target execution modes considered by validation: "
+            "direct, plan, self_refine."
+        ),
+    )
     parser.add_argument("--prompt", help="Override the default base prompt.")
     parser.add_argument("--prompt-file", help="Read the base prompt from a file.")
     parser.add_argument(
@@ -192,6 +200,7 @@ async def async_main() -> None:
         rejected_candidate_margin=args.rejected_candidate_margin,
         prompt_complexity_margin=args.prompt_complexity_margin,
         self_refine_rounds=args.self_refine_rounds,
+        execution_modes=_parse_execution_modes(args.execution_modes),
         allow_code_execution=args.allow_code_execution,
         show_progress=not args.no_progress,
         base_prompt=base_prompt,
@@ -247,6 +256,7 @@ async def async_main() -> None:
                 "rejected_candidate_margin": args.rejected_candidate_margin,
                 "prompt_complexity_margin": args.prompt_complexity_margin,
                 "self_refine_rounds": args.self_refine_rounds,
+                "execution_modes": args.execution_modes,
                 "train_n": train_n,
                 "val_n": val_n,
                 "test_n": test_n,
@@ -377,6 +387,25 @@ def _parse_bool(value: str) -> bool:
     if normalized in {"0", "false", "f", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError("expected True or False")
+
+
+def _parse_execution_modes(value: str) -> tuple[str, ...]:
+    modes = tuple(
+        item.strip().lower().replace("-", "_")
+        for item in str(value).split(",")
+        if item.strip()
+    )
+    if not modes:
+        raise SystemExit("--execution-modes must include at least one mode")
+    allowed = {"direct", "plan", "self_refine", "auto"}
+    invalid = [mode for mode in modes if mode not in allowed]
+    if invalid:
+        raise SystemExit(
+            "--execution-modes contains unsupported mode(s): "
+            + ", ".join(invalid)
+            + ". Use direct, plan, self_refine, or auto."
+        )
+    return modes
 
 
 def _parse_workers(value: str) -> int:

@@ -172,6 +172,31 @@ class SelfRefineTargetClient(FakeTargetClient):
         )
 
 
+class PlanTargetClient(FakeTargetClient):
+    async def complete(
+        self,
+        prompt: str,
+        input: Any,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ClientResponse:
+        del input
+        self.calls += 1
+        phase = str((metadata or {}).get("phase"))
+        if (metadata or {}).get("canary_id"):
+            output = '{"priority": "urgent"}'
+        elif phase.endswith("_plan_contract"):
+            output = '{"goal":"answer arithmetic","answer_shape":"number","hard_constraints":[],"solve_plan":["compute"],"final_checks":["number only"]}'
+        elif phase.endswith("_plan_answer"):
+            output = "5" if "Classify tickets" in prompt else "4"
+        else:
+            output = "5"
+        return ClientResponse(
+            output=output,
+            raw=output,
+            call_record=_record(CallRole.TARGET, "target_complete", metadata),
+        )
+
+
 def _record(
     role: CallRole,
     name: str,
@@ -229,6 +254,7 @@ async def test_gavel_baseline_compiles_and_reports_splits(tmp_path, sample_compi
         workers=2,
         show_progress=False,
         self_refine_rounds=0,
+        execution_modes=("direct",),
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0"), _numeric_example("gsm8k:train:1")],
@@ -265,6 +291,7 @@ async def test_gavel_validation_gate_rolls_back_regressing_prompt(tmp_path, samp
         show_progress=False,
         validation_gate=True,
         self_refine_rounds=0,
+        execution_modes=("direct",),
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],
@@ -302,6 +329,7 @@ async def test_gavel_validation_gate_can_override_synthetic_canary_rejection(
         validate_rejected_candidates=True,
         prompt_portfolio=False,
         self_refine_rounds=0,
+        execution_modes=("direct",),
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],
@@ -338,6 +366,7 @@ async def test_gavel_validation_gate_can_select_task_strategy_from_portfolio(
         validation_gate=True,
         prompt_portfolio=True,
         self_refine_rounds=0,
+        execution_modes=("direct",),
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],
@@ -389,6 +418,9 @@ def test_gavel_temperature_validation():
     with pytest.raises(ValueError, match="self_refine_rounds must be non-negative"):
         GavelConfig(self_refine_rounds=-1).validate()
 
+    with pytest.raises(ValueError, match="execution mode must be one of"):
+        GavelConfig(execution_modes=("unsupported",)).validate()
+
 
 @pytest.mark.asyncio
 async def test_gavel_evaluation_uses_worker_concurrency():
@@ -426,3 +458,60 @@ async def test_gavel_evaluation_can_self_refine_without_scorer_feedback():
     assert predictions[0]["prediction"] == "4"
     assert scores[0].score == 1.0
     assert stats.api_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_gavel_evaluation_can_plan_then_answer_without_scorer_feedback():
+    predictions, scores, stats = await evaluate_prompt(
+        prompt="answer",
+        examples=[_numeric_example("gsm8k:test:0")],
+        target_client=PlanTargetClient(),
+        allow_code_execution=False,
+        show_progress=False,
+        workers=1,
+        description="test",
+        phase="test",
+        execution_mode="plan",
+    )
+
+    assert predictions[0]["prediction"] == "4"
+    assert predictions[0]["execution_mode"] == "plan"
+    assert scores[0].score == 1.0
+    assert stats.api_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_gavel_validation_gate_can_select_execution_mode(
+    tmp_path,
+    sample_compiler_output,
+):
+    config = GavelConfig(
+        model="fake-target",
+        optimizer_model="fake-optimizer",
+        output_dir=tmp_path,
+        cache=False,
+        workers=2,
+        show_progress=False,
+        validation_gate=True,
+        prompt_portfolio=False,
+        self_refine_rounds=0,
+        execution_modes=("direct", "plan"),
+    )
+    result = await run_gavel_baseline(
+        train_examples=[_numeric_example("gsm8k:train:0")],
+        val_examples=[_numeric_example("gsm8k:validation:0")],
+        test_examples=[_numeric_example("gsm8k:test:0")],
+        config=config,
+        benchmark_spec=_spec(),
+        optimizer_client=FakeOptimizerClient(sample_compiler_output.model_dump_json()),
+        target_client=PlanTargetClient(),
+    )
+
+    gate = result.summary["validation_gate"]
+    assert result.summary["selected_prompt"] == "base"
+    assert result.summary["selected_execution_mode"] == "plan"
+    assert result.summary["accepted"] is True
+    assert result.summary["decision"] == "validation_selected_execution_mode"
+    assert gate["base"]["score"] == 0.0
+    assert gate["candidate"]["score"] == 1.0
+    assert result.summary["split_results"]["test"]["score"] == 1.0

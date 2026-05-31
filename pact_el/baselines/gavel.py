@@ -68,6 +68,7 @@ class GavelConfig:
     rejected_candidate_margin: float = 0.08
     prompt_complexity_margin: float = 0.02
     self_refine_rounds: int = 1
+    execution_modes: Tuple[str, ...] = ("direct", "plan", "self_refine")
     allow_code_execution: bool = False
     show_progress: bool = True
     base_prompt: Optional[str] = None
@@ -89,6 +90,7 @@ class GavelConfig:
             raise ValueError("prompt_complexity_margin must be between 0 and 1")
         if self.self_refine_rounds < 0:
             raise ValueError("self_refine_rounds must be non-negative")
+        _resolve_execution_modes(self.execution_modes, self.self_refine_rounds)
 
 
 @dataclass
@@ -127,11 +129,13 @@ class PromptSelection:
     enabled: bool = True
     candidate_source: str = "accepted"
     effective_margin: float = 0.0
+    execution_mode: str = "direct"
 
     def summary(self) -> Dict[str, Any]:
         return {
             "enabled": self.enabled,
             "selected_prompt": self.selected_variant,
+            "selected_execution_mode": self.execution_mode,
             "decision": self.decision,
             "reason": self.reason,
             "api_calls": self.api_calls,
@@ -155,6 +159,22 @@ class PromptCandidate:
     report_accepted: bool = False
 
 
+@dataclass(frozen=True)
+class EvaluationCandidate:
+    """One prompt/execution-mode option evaluated by the validation gate."""
+
+    prompt_name: str
+    prompt: str
+    source: str
+    report_decision: str
+    report_accepted: bool
+    execution_mode: str
+
+    @property
+    def name(self) -> str:
+        return _evaluation_candidate_key(self.prompt_name, self.execution_mode)
+
+
 async def run_gavel_baseline(
     *,
     train_examples: Sequence[BenchmarkExample],
@@ -174,6 +194,7 @@ async def run_gavel_baseline(
     base_prompt = config.base_prompt or default_base_prompt(benchmark_spec)
     task_spec = _task_spec(benchmark_spec)
     rubric = _rubric(benchmark_spec)
+    execution_modes = _resolve_execution_modes(config.execution_modes, config.self_refine_rounds)
 
     optimizer_client = optimizer_client or _build_optimizer_client(config)
     target_client = target_client or _build_target_client(config)
@@ -198,6 +219,7 @@ async def run_gavel_baseline(
         description="GAVEL evidence",
         phase="evidence",
         self_refine_rounds=config.self_refine_rounds,
+        execution_mode="direct",
     )
     logs = _evidence_logs(train_examples, evidence_predictions, evidence_scores)
 
@@ -234,12 +256,14 @@ async def run_gavel_baseline(
         rejected_candidate_margin=config.rejected_candidate_margin,
         prompt_complexity_margin=config.prompt_complexity_margin,
         self_refine_rounds=config.self_refine_rounds,
+        execution_modes=execution_modes,
     )
     report.metadata = {
         **report.metadata,
         "validation_gate": prompt_selection.summary(),
     }
     optimized_prompt = prompt_selection.prompt
+    reference_execution_mode = "direct" if "direct" in execution_modes else execution_modes[0]
 
     split_evaluations = await _evaluate_report_splits(
         prompt=optimized_prompt,
@@ -253,6 +277,7 @@ async def run_gavel_baseline(
         show_progress=config.show_progress,
         workers=config.workers,
         self_refine_rounds=config.self_refine_rounds,
+        execution_mode=prompt_selection.execution_mode,
     )
     test_eval = split_evaluations["test"]
     scores = test_eval["scores"]
@@ -307,12 +332,17 @@ async def run_gavel_baseline(
         "budget": config.budget,
         "prompt_portfolio": config.prompt_portfolio,
         "self_refine_rounds": config.self_refine_rounds,
+        "execution_modes": list(execution_modes),
         "validation_confidence_z": config.validation_confidence_z,
         "rejected_candidate_margin": config.rejected_candidate_margin,
         "prompt_complexity_margin": config.prompt_complexity_margin,
-        "accepted": prompt_selection.selected_variant != "base",
+        "accepted": (
+            prompt_selection.selected_variant != "base"
+            or prompt_selection.execution_mode != reference_execution_mode
+        ),
         "decision": prompt_selection.decision,
         "selected_prompt": prompt_selection.selected_variant,
+        "selected_execution_mode": prompt_selection.execution_mode,
         "validation_gate": prompt_selection.summary(),
         "optimization_api_calls": optimization_api_calls,
         "predictions_path": str(predictions_path),
@@ -353,11 +383,13 @@ async def evaluate_prompt(
     description: str,
     phase: str,
     self_refine_rounds: int = 0,
+    execution_mode: str = "auto",
 ) -> tuple[List[Dict[str, Any]], List[ScoreResult], EvaluationStats]:
     if workers < 1:
         raise ValueError("workers must be at least 1")
     if self_refine_rounds < 0:
         raise ValueError("self_refine_rounds must be non-negative")
+    resolved_execution_mode = _resolve_execution_mode(execution_mode, self_refine_rounds)
     predictions: List[Optional[Dict[str, Any]]] = [None] * len(examples)
     scores: List[Optional[ScoreResult]] = [None] * len(examples)
     progress = tqdm(
@@ -388,7 +420,7 @@ async def evaluate_prompt(
                     max_in_flight=stats.max_in_flight,
                 )
             try:
-                output, raw_output, call_count = await _complete_with_self_refinement(
+                output, raw_output, call_count = await _complete_with_execution_mode(
                     prompt=prompt,
                     user_input=example.prompt,
                     target_client=target_client,
@@ -398,6 +430,7 @@ async def evaluate_prompt(
                         "benchmark_id": example.benchmark_id,
                     },
                     self_refine_rounds=self_refine_rounds,
+                    execution_mode=resolved_execution_mode,
                 )
                 stats.api_calls += call_count
             finally:
@@ -416,6 +449,7 @@ async def evaluate_prompt(
                     "benchmark_id": example.benchmark_id,
                     "prediction": prediction,
                     "raw_prediction": raw_output,
+                    "execution_mode": resolved_execution_mode,
                 },
                 score,
             )
@@ -452,6 +486,72 @@ async def evaluate_prompt(
     )
 
 
+async def _complete_with_execution_mode(
+    *,
+    prompt: str,
+    user_input: Any,
+    target_client: TargetClient,
+    metadata: Mapping[str, Any],
+    self_refine_rounds: int,
+    execution_mode: str,
+) -> tuple[Any, Any, int]:
+    mode = _resolve_execution_mode(execution_mode, self_refine_rounds)
+    if mode == "direct":
+        response = await target_client.complete(prompt, user_input, metadata=metadata)
+        return response.output, response.output, 1
+    if mode == "self_refine":
+        return await _complete_with_self_refinement(
+            prompt=prompt,
+            user_input=user_input,
+            target_client=target_client,
+            metadata=metadata,
+            self_refine_rounds=max(1, self_refine_rounds),
+        )
+    if mode == "plan":
+        return await _complete_with_planning(
+            prompt=prompt,
+            user_input=user_input,
+            target_client=target_client,
+            metadata=metadata,
+        )
+    raise ValueError(f"unsupported execution mode: {execution_mode}")
+
+
+async def _complete_with_planning(
+    *,
+    prompt: str,
+    user_input: Any,
+    target_client: TargetClient,
+    metadata: Mapping[str, Any],
+) -> tuple[Any, Any, int]:
+    plan_metadata = {
+        **dict(metadata),
+        "phase": f"{metadata.get('phase', 'target')}_plan_contract",
+        "execution_mode": "plan",
+    }
+    plan_response = await target_client.complete(
+        _planning_prompt(prompt),
+        _planning_input(user_input),
+        metadata=plan_metadata,
+    )
+    answer_metadata = {
+        **dict(metadata),
+        "phase": f"{metadata.get('phase', 'target')}_plan_answer",
+        "execution_mode": "plan",
+    }
+    answer_response = await target_client.complete(
+        _planned_answer_prompt(prompt),
+        _planned_answer_input(user_input, plan_response.output),
+        metadata=answer_metadata,
+    )
+    raw_output = {
+        "execution_mode": "plan",
+        "task_contract": plan_response.output,
+        "final_answer": answer_response.output,
+    }
+    return answer_response.output, raw_output, 2
+
+
 async def _complete_with_self_refinement(
     *,
     prompt: str,
@@ -483,6 +583,151 @@ async def _complete_with_self_refinement(
         raw_output = response.output
         call_count += 1
     return output, raw_output, call_count
+
+
+def _planning_prompt(runtime_prompt: str) -> str:
+    clipped_prompt = _truncate_text(runtime_prompt.strip(), max_chars=9000)
+    sections = [
+        (
+            "Goal",
+            [
+                "Compile the original user prompt into a compact task contract that can guide a strict final answer.",
+            ],
+        ),
+        (
+            "Context",
+            [
+                "This is a label-free planning pass. You do not have benchmark labels, hidden evaluator data, expected answers, or scorer feedback.",
+                "The runtime instructions that govern the final answer are included below. Apply them as authoritative guidance.",
+                clipped_prompt,
+            ],
+        ),
+        (
+            "Role",
+            [
+                "Act as a precise task analyst and constraint compiler.",
+            ],
+        ),
+        (
+            "Input",
+            [
+                "You will receive one original user prompt.",
+            ],
+        ),
+        (
+            "Task",
+            [
+                "Extract the user's goal, the required answer shape, and every explicit hard constraint.",
+                "Identify counts, ordering, required text, forbidden text, casing, delimiters, language, units, choices, code requirements, and edge cases when present.",
+                "For reasoning tasks, identify the shortest path to the final answer and the normalized output expected by the prompt.",
+                "For creative or open-ended tasks, identify the mechanical constraints that must still be satisfied exactly.",
+            ],
+        ),
+        (
+            "Constraints",
+            [
+                "Do not solve using hidden labels or evaluator metadata.",
+                "Do not invent requirements that are not supported by the current user prompt.",
+                "Keep the contract concise enough to be useful in a second pass.",
+            ],
+        ),
+        (
+            "Output Format",
+            [
+                "Return JSON with keys: goal, answer_shape, hard_constraints, solve_plan, final_checks.",
+                "Use short strings or arrays of short strings. Do not include markdown fences.",
+            ],
+        ),
+        (
+            "Quality Bar",
+            [
+                "The contract is complete only if a second pass can use it to produce an answer that a strict verifier could score.",
+            ],
+        ),
+    ]
+    return _render_structured_sections(sections)
+
+
+def _planning_input(user_input: Any) -> str:
+    input_text = user_input if isinstance(user_input, str) else json.dumps(user_input, sort_keys=True)
+    return (
+        "Original user prompt:\n"
+        f"{input_text}\n\n"
+        "Return only the task contract JSON."
+    )
+
+
+def _planned_answer_prompt(runtime_prompt: str) -> str:
+    clipped_prompt = _truncate_text(runtime_prompt.strip(), max_chars=9000)
+    sections = [
+        (
+            "Goal",
+            [
+                "Produce the final answer requested by the original user prompt using the task contract.",
+            ],
+        ),
+        (
+            "Context",
+            [
+                "A previous label-free pass extracted a task contract from the current user prompt.",
+                "The runtime instructions that govern the final answer are included below. Apply them as authoritative guidance.",
+                clipped_prompt,
+            ],
+        ),
+        (
+            "Role",
+            [
+                "Act as a strict solver and final-answer editor.",
+            ],
+        ),
+        (
+            "Input",
+            [
+                "You will receive the original user prompt and the task contract.",
+            ],
+        ),
+        (
+            "Task",
+            [
+                "Solve the original user prompt directly.",
+                "Use the task contract to satisfy every hard constraint before optimizing style or elaboration.",
+                "Privately run the final checks from the contract and minimally revise any failing part.",
+            ],
+        ),
+        (
+            "Constraints",
+            [
+                "Do not mention the task contract, planning pass, validation, benchmark, or hidden reasoning.",
+                "Do not add wrappers, labels, markdown fences, explanations, or extra sections unless the original user prompt requires them.",
+                "If the contract conflicts with the original user prompt, obey the original user prompt.",
+            ],
+        ),
+        (
+            "Output Format",
+            [
+                "Return only the final answer requested by the original user prompt.",
+            ],
+        ),
+        (
+            "Quality Bar",
+            [
+                "The final answer is acceptable only if it satisfies the original prompt and every explicit mechanical constraint.",
+            ],
+        ),
+    ]
+    return _render_structured_sections(sections)
+
+
+def _planned_answer_input(user_input: Any, task_contract: Any) -> str:
+    input_text = user_input if isinstance(user_input, str) else json.dumps(user_input, sort_keys=True)
+    contract_text = "" if task_contract is None else str(task_contract)
+    return (
+        "Original user prompt:\n"
+        f"{input_text}\n\n"
+        "Task contract from label-free planning pass:\n"
+        f"{contract_text}\n\n"
+        "Return only the final answer."
+    )
 
 
 def _self_refinement_prompt(runtime_prompt: str) -> str:
@@ -867,6 +1112,43 @@ def _render_structured_sections(sections: Sequence[tuple[str, Sequence[str]]]) -
     return "\n".join(lines).strip()
 
 
+_ALLOWED_EXECUTION_MODES = {"direct", "self_refine", "plan"}
+
+
+def _resolve_execution_mode(mode: str, self_refine_rounds: int) -> str:
+    normalized = str(mode or "auto").strip().lower().replace("-", "_")
+    if normalized == "auto":
+        return "self_refine" if self_refine_rounds > 0 else "direct"
+    if normalized not in _ALLOWED_EXECUTION_MODES:
+        raise ValueError(
+            "execution mode must be one of: "
+            + ", ".join(sorted(_ALLOWED_EXECUTION_MODES | {"auto"}))
+        )
+    if normalized == "self_refine" and self_refine_rounds <= 0:
+        return "direct"
+    return normalized
+
+
+def _resolve_execution_modes(
+    modes: Sequence[str],
+    self_refine_rounds: int,
+) -> Tuple[str, ...]:
+    if not modes:
+        raise ValueError("execution_modes must include at least one mode")
+    resolved: List[str] = []
+    for mode in modes:
+        normalized = _resolve_execution_mode(mode, self_refine_rounds)
+        if normalized not in resolved:
+            resolved.append(normalized)
+    if not resolved:
+        raise ValueError("execution_modes must include at least one executable mode")
+    return tuple(resolved)
+
+
+def _evaluation_candidate_key(prompt_name: str, execution_mode: str) -> str:
+    return f"{prompt_name}/{execution_mode}"
+
+
 def _extend_section(
     sections: List[tuple[str, List[str]]],
     title: str,
@@ -1099,14 +1381,18 @@ async def _select_prompt_with_validation(
     rejected_candidate_margin: float,
     prompt_complexity_margin: float,
     self_refine_rounds: int,
+    execution_modes: Sequence[str],
 ) -> PromptSelection:
     unique_candidates = _dedupe_candidates(candidates, base_prompt=base_prompt)
+    resolved_execution_modes = _resolve_execution_modes(execution_modes, self_refine_rounds)
+    fallback_execution_mode = _resolve_execution_mode("auto", self_refine_rounds)
     if not enabled:
         candidate = _preferred_candidate(unique_candidates)
         selected_variant = candidate.name if candidate is not None and candidate.report_accepted else "base"
         return PromptSelection(
             prompt=candidate.prompt if candidate is not None and selected_variant != "base" else base_prompt,
             selected_variant=selected_variant,
+            execution_mode=fallback_execution_mode,
             decision=candidate.report_decision if candidate is not None else "base",
             reason="validation gate disabled",
             margin=margin,
@@ -1114,10 +1400,11 @@ async def _select_prompt_with_validation(
             candidate_source=candidate.source if candidate is not None else "base",
             effective_margin=margin,
         )
-    if not unique_candidates:
+    if not unique_candidates and len(resolved_execution_modes) == 1:
         return PromptSelection(
             prompt=base_prompt,
             selected_variant="base",
+            execution_mode=fallback_execution_mode,
             decision="base",
             reason="no validation candidates are available",
             margin=margin,
@@ -1126,9 +1413,21 @@ async def _select_prompt_with_validation(
         )
     if not val_examples:
         candidate = _preferred_candidate(unique_candidates)
+        if candidate is None:
+            return PromptSelection(
+                prompt=base_prompt,
+                selected_variant="base",
+                execution_mode=fallback_execution_mode,
+                decision="base",
+                reason="no validation examples available",
+                margin=margin,
+                candidate_source="base",
+                effective_margin=margin,
+            )
         return PromptSelection(
             prompt=candidate.prompt,
             selected_variant=candidate.name,
+            execution_mode=fallback_execution_mode,
             decision=candidate.report_decision,
             reason="no validation examples available",
             margin=margin,
@@ -1136,6 +1435,7 @@ async def _select_prompt_with_validation(
             effective_margin=margin,
         )
 
+    reference_mode = "direct" if "direct" in resolved_execution_modes else resolved_execution_modes[0]
     base_predictions, base_scores, base_stats = await evaluate_prompt(
         prompt=base_prompt,
         examples=val_examples,
@@ -1144,8 +1444,9 @@ async def _select_prompt_with_validation(
         show_progress=show_progress,
         workers=workers,
         description="GAVEL validation gate/base",
-        phase="validation_gate_base",
+        phase=_validation_phase("base", reference_mode),
         self_refine_rounds=self_refine_rounds,
+        execution_mode=reference_mode,
     )
     del base_predictions
 
@@ -1155,44 +1456,79 @@ async def _select_prompt_with_validation(
         api_calls=base_stats.api_calls,
         stats=base_stats,
     )
+    base_summary["prompt_name"] = "base"
+    base_summary["execution_mode"] = reference_mode
     candidate_summaries: Dict[str, Dict[str, Any]] = {}
-    evaluated_candidates: List[tuple[PromptCandidate, Dict[str, Any], List[ScoreResult]]] = []
+    evaluated_candidates: List[tuple[EvaluationCandidate, Dict[str, Any], List[ScoreResult]]] = []
     api_calls = base_stats.api_calls
-    for candidate in unique_candidates:
-        candidate_predictions, candidate_scores, candidate_stats = await evaluate_prompt(
-            prompt=candidate.prompt,
-            examples=val_examples,
-            target_client=target_client,
-            allow_code_execution=allow_code_execution,
-            show_progress=show_progress,
-            workers=workers,
-            description=f"GAVEL validation gate/{candidate.name}",
-            phase=f"validation_gate_{candidate.name}",
-            self_refine_rounds=self_refine_rounds,
-        )
-        del candidate_predictions
-        candidate_summary = _split_result_summary(
-            candidate_scores,
-            examples=len(val_examples),
-            api_calls=candidate_stats.api_calls,
-            stats=candidate_stats,
-        )
-        paired = _paired_score_stats(base_scores, candidate_scores)
-        required_margin = _effective_validation_margin(
-            base_prompt=base_prompt,
-            candidate=candidate,
-            base_summary=base_summary,
-            candidate_summary=candidate_summary,
-            user_margin=margin,
-            confidence_z=confidence_z,
-            rejected_candidate_margin=rejected_candidate_margin,
-            prompt_complexity_margin=prompt_complexity_margin,
-        )
-        candidate_summary["paired"] = paired
-        candidate_summary["required_margin"] = required_margin
-        candidate_summaries[candidate.name] = candidate_summary
-        evaluated_candidates.append((candidate, candidate_summary, candidate_scores))
-        api_calls += candidate_stats.api_calls
+    prompt_options = [
+        PromptCandidate(
+            name="base",
+            prompt=base_prompt,
+            source="base",
+            report_decision="base",
+            report_accepted=True,
+        ),
+        *unique_candidates,
+    ]
+    for prompt_candidate in prompt_options:
+        for execution_mode in resolved_execution_modes:
+            eval_candidate = EvaluationCandidate(
+                prompt_name=prompt_candidate.name,
+                prompt=prompt_candidate.prompt,
+                source=prompt_candidate.source,
+                report_decision=prompt_candidate.report_decision,
+                report_accepted=prompt_candidate.report_accepted,
+                execution_mode=execution_mode,
+            )
+            if eval_candidate.prompt_name == "base" and execution_mode == reference_mode:
+                continue
+            candidate_predictions, candidate_scores, candidate_stats = await evaluate_prompt(
+                prompt=eval_candidate.prompt,
+                examples=val_examples,
+                target_client=target_client,
+                allow_code_execution=allow_code_execution,
+                show_progress=show_progress,
+                workers=workers,
+                description=f"GAVEL validation gate/{eval_candidate.name}",
+                phase=_validation_phase(eval_candidate.prompt_name, execution_mode),
+                self_refine_rounds=self_refine_rounds,
+                execution_mode=execution_mode,
+            )
+            del candidate_predictions
+            candidate_summary = _split_result_summary(
+                candidate_scores,
+                examples=len(val_examples),
+                api_calls=candidate_stats.api_calls,
+                stats=candidate_stats,
+            )
+            paired = _paired_score_stats(base_scores, candidate_scores)
+            required_margin = _effective_validation_margin(
+                base_prompt=base_prompt,
+                candidate=PromptCandidate(
+                    name=eval_candidate.prompt_name,
+                    prompt=eval_candidate.prompt,
+                    source=eval_candidate.source,
+                    report_decision=eval_candidate.report_decision,
+                    report_accepted=eval_candidate.report_accepted,
+                ),
+                base_summary=base_summary,
+                candidate_summary=candidate_summary,
+                user_margin=margin,
+                confidence_z=confidence_z,
+                rejected_candidate_margin=rejected_candidate_margin,
+                prompt_complexity_margin=prompt_complexity_margin,
+            )
+            candidate_summary["prompt_name"] = eval_candidate.prompt_name
+            candidate_summary["execution_mode"] = execution_mode
+            candidate_summary["candidate_source"] = eval_candidate.source
+            candidate_summary["paired"] = paired
+            candidate_summary["required_margin"] = required_margin
+            candidate_summaries[eval_candidate.name] = candidate_summary
+            if eval_candidate.prompt_name != "base" and execution_mode == reference_mode:
+                candidate_summaries.setdefault(eval_candidate.prompt_name, candidate_summary)
+            evaluated_candidates.append((eval_candidate, candidate_summary, candidate_scores))
+            api_calls += candidate_stats.api_calls
 
     base_metric = _selection_metric(base_summary)
     scored_candidates = [
@@ -1203,15 +1539,29 @@ async def _select_prompt_with_validation(
     ]
     if base_metric is None or not scored_candidates:
         fallback = _preferred_candidate(unique_candidates)
-        selected_variant = fallback.name if base_metric is None and fallback.report_accepted else "base"
+        selected_variant = (
+            fallback.name
+            if fallback is not None and base_metric is None and fallback.report_accepted
+            else "base"
+        )
         return PromptSelection(
             prompt=fallback.prompt if selected_variant != "base" else base_prompt,
             selected_variant=selected_variant,
-            decision=fallback.report_decision if selected_variant != "base" else "validation_unscored_rollback",
+            execution_mode=fallback_execution_mode,
+            decision=(
+                fallback.report_decision
+                if selected_variant != "base"
+                else "validation_unscored_rollback"
+            ),
             reason="validation scorer produced no comparable metric",
             api_calls=api_calls,
             base_summary=base_summary,
-            candidate_summary=candidate_summaries.get(fallback.name) if fallback is not None else None,
+            candidate_summary=(
+                candidate_summaries.get(_evaluation_candidate_key(fallback.name, fallback_execution_mode))
+                or candidate_summaries.get(fallback.name)
+                if fallback is not None
+                else None
+            ),
             candidate_summaries=candidate_summaries,
             margin=margin,
             candidate_source=fallback.source if fallback is not None else "base",
@@ -1224,20 +1574,24 @@ async def _select_prompt_with_validation(
             item[2] - base_metric - item[3],
             item[2],
             1 if item[0].report_accepted else 0,
-            _candidate_priority(item[0]),
+            _evaluation_candidate_priority(item[0]),
         ),
     )
     paired = best_summary.get("paired") or {}
     paired_ok = int(paired.get("wins") or 0) >= int(paired.get("losses") or 0)
     if best_metric + 1e-12 >= base_metric + best_required_margin and paired_ok:
-        decision = (
-            best_candidate.report_decision
-            if best_candidate.report_accepted
-            else "validation_override"
-        )
+        if best_candidate.prompt_name == "base":
+            decision = "validation_selected_execution_mode"
+        else:
+            decision = (
+                best_candidate.report_decision
+                if best_candidate.report_accepted
+                else "validation_override"
+            )
         return PromptSelection(
             prompt=best_candidate.prompt,
-            selected_variant=best_candidate.name,
+            selected_variant=best_candidate.prompt_name,
+            execution_mode=best_candidate.execution_mode,
             decision=decision,
             reason=(
                 f"{best_candidate.name} validation metric {best_metric:.4f} met "
@@ -1254,6 +1608,7 @@ async def _select_prompt_with_validation(
     return PromptSelection(
         prompt=base_prompt,
         selected_variant="base",
+        execution_mode=reference_mode,
         decision="validation_rollback",
         reason=(
             f"best candidate validation metric {best_metric:.4f} fell below "
@@ -1384,6 +1739,28 @@ def _candidate_priority(candidate: PromptCandidate) -> int:
     return priorities.get(candidate.name, 0)
 
 
+def _evaluation_candidate_priority(candidate: EvaluationCandidate) -> int:
+    mode_priorities = {
+        "plan": 3,
+        "self_refine": 2,
+        "direct": 1,
+    }
+    return _candidate_priority(
+        PromptCandidate(
+            name=candidate.prompt_name,
+            prompt=candidate.prompt,
+            source=candidate.source,
+            report_decision=candidate.report_decision,
+            report_accepted=candidate.report_accepted,
+        )
+    ) * 10 + mode_priorities.get(candidate.execution_mode, 0)
+
+
+def _validation_phase(prompt_name: str, execution_mode: str) -> str:
+    base = f"validation_gate_{prompt_name}"
+    return base if execution_mode == "direct" else f"{base}_{execution_mode}"
+
+
 def _paired_score_stats(
     base_scores: Sequence[ScoreResult],
     candidate_scores: Sequence[ScoreResult],
@@ -1485,6 +1862,7 @@ async def _evaluate_report_splits(
     show_progress: bool,
     workers: int,
     self_refine_rounds: int,
+    execution_mode: str,
 ) -> Dict[str, Dict[str, Any]]:
     split_examples = {
         "train": list(train_examples),
@@ -1503,6 +1881,7 @@ async def _evaluate_report_splits(
             description=f"GAVEL {split_name}",
             phase=f"final_{split_name}",
             self_refine_rounds=self_refine_rounds,
+            execution_mode=execution_mode,
         )
         predictions_path, scores_path = _write_split_outputs(
             output_dir,
