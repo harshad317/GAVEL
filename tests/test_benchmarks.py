@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import configparser
 import csv
 import json
 import sys
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +44,21 @@ def test_registry_contains_requested_official_benchmarks():
         "mmlu_pro",
     } <= ids
     assert get_benchmark_spec("mmlu-pro").benchmark_id == "mmlu_pro"
+
+
+def test_ifbench_extra_pins_setuptools_for_pkg_resources():
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text())
+    pyproject_ifbench = pyproject["project"]["optional-dependencies"]["ifbench"]
+
+    setup_cfg = configparser.ConfigParser()
+    setup_cfg.read("setup.cfg")
+    setup_ifbench = [
+        item.strip()
+        for item in setup_cfg["options.extras_require"]["ifbench"].strip().splitlines()
+    ]
+
+    assert "setuptools<81 ; python_version >= '3.10'" in pyproject_ifbench
+    assert 'setuptools<81 ; python_version >= "3.10"' in setup_ifbench
 
 
 def test_gsm8k_adapter_extracts_final_numeric_answer(tmp_path):
