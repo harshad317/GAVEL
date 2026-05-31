@@ -8,6 +8,7 @@ import pytest
 
 from pact_el.baselines.dspy_mipro import (
     DSPyMIPROConfig,
+    MissingBenchmarkEvaluatorError,
     _evaluate_program_with_stats,
     build_dspy_metric,
     build_gepa_metric,
@@ -128,6 +129,26 @@ def numeric_example(example_id="gsm8k:test:0"):
     )
 
 
+def ifbench_example(example_id="ifbench:test:0"):
+    return BenchmarkExample(
+        benchmark_id="ifbench",
+        example_id=example_id,
+        split="test",
+        prompt="Include keyword apple once.",
+        expected_answer=None,
+        metric=MetricKind.OFFICIAL_EVALUATOR,
+        source_url="official",
+        metadata={
+            "official_input_row": {
+                "key": "0",
+                "prompt": "Include keyword apple once.",
+                "instruction_id_list": ["count:keywords"],
+                "kwargs": [{"keyword": "apple", "frequency": 1}],
+            }
+        },
+    )
+
+
 def test_dspy_metric_delegates_to_normalized_scorer():
     example = numeric_example()
     dspy_example = FakeDSPyExample(
@@ -241,6 +262,35 @@ def test_mipro_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):
     assert result.summary["split_results"]["val"]["score"] == 1.0
     assert result.summary["split_results"]["test"]["score"] == 1.0
     assert "optimization" in result.summary["split_results"]
+
+
+def test_ifbench_baseline_fails_fast_when_official_evaluator_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "pact_el.baselines.dspy_mipro.ifbench_evaluator_missing_details",
+        lambda: {
+            "reason": "official IFBench evaluator is not installed",
+            "install": "python -m pip install -e '.[ifbench]'",
+            "missing_module": "ifbench",
+        },
+    )
+    out_dir = tmp_path / "out"
+    config = DSPyMIPROConfig(
+        optimizer="mipro",
+        program="cot",
+        model="fake/model",
+        output_dir=out_dir,
+    )
+    example = ifbench_example()
+
+    with pytest.raises(MissingBenchmarkEvaluatorError, match="Install it with"):
+        run_dspy_baseline(
+            [example],
+            config=config,
+            train_examples=[ifbench_example("ifbench:train:0")],
+            val_examples=[ifbench_example("ifbench:validation:0")],
+        )
+
+    assert not out_dir.exists()
 
 
 def test_gepa_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):

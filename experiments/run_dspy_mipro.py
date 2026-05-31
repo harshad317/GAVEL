@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pact_el.baselines.dspy_mipro import (
     DSPyMIPROConfig,
+    MissingBenchmarkEvaluatorError,
     MissingDSPyError,
     load_examples,
     run_dspy_baseline,
@@ -264,7 +265,7 @@ def main() -> None:
             val_examples=selection.validation,
             selection_summary=selection.manifest,
         )
-    except MissingDSPyError as exc:
+    except (MissingDSPyError, MissingBenchmarkEvaluatorError) as exc:
         raise SystemExit(str(exc)) from exc
     if args.json:
         print(json.dumps(result.summary, indent=2, sort_keys=True))

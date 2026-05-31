@@ -19,6 +19,9 @@ from tqdm.auto import tqdm
 
 from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind, ScoreResult
 
+IFBENCH_EVALUATOR_MISSING_REASON = "official IFBench evaluator is not installed"
+IFBENCH_INSTALL_COMMAND = "python -m pip install -e '.[ifbench]'"
+
 
 @dataclass
 class ScoreAccumulator:
@@ -397,11 +400,7 @@ def _score_ifbench_official(example: BenchmarkExample, prediction: Any) -> Score
             passed=None,
             prediction=prediction,
             expected=example.expected_answer,
-            details={
-                "reason": "official IFBench evaluator is not installed",
-                "install": "python -m pip install -e '.[ifbench]'",
-                "missing_module": exc.name,
-            },
+            details=_missing_ifbench_evaluator_details(exc),
         )
 
     inp = evaluation_lib.InputExample(
@@ -435,6 +434,22 @@ def _import_ifbench_evaluation_lib() -> Any:
         return importlib.import_module("evaluation_lib")
     except ModuleNotFoundError:
         return importlib.import_module("ifbench.evaluation_lib")
+
+
+def ifbench_evaluator_missing_details() -> Optional[Dict[str, Any]]:
+    try:
+        _import_ifbench_evaluation_lib()
+    except ModuleNotFoundError as exc:
+        return _missing_ifbench_evaluator_details(exc)
+    return None
+
+
+def _missing_ifbench_evaluator_details(exc: ModuleNotFoundError) -> Dict[str, Any]:
+    return {
+        "reason": IFBENCH_EVALUATOR_MISSING_REASON,
+        "install": IFBENCH_INSTALL_COMMAND,
+        "missing_module": exc.name,
+    }
 
 
 def extract_choice(prediction: str, choices: Sequence[str]) -> Optional[str]:

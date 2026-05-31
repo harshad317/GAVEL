@@ -21,12 +21,13 @@ from tqdm.auto import tqdm
 
 from pact_el.benchmarks.scoring import (
     ScoreAccumulator,
+    ifbench_evaluator_missing_details,
     load_normalized_examples,
     score_prediction,
     summarize_scores,
     summarize_unscored_reasons,
 )
-from pact_el.benchmarks.schemas import BenchmarkExample, ScoreResult
+from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind, ScoreResult
 
 
 DSPY_GITHUB_URL = "https://github.com/stanfordnlp/dspy"
@@ -40,6 +41,10 @@ DSPY_GEPA_GITHUB_URL = (
 
 class MissingDSPyError(RuntimeError):
     """Raised when the optional DSPy baseline dependency is unavailable."""
+
+
+class MissingBenchmarkEvaluatorError(RuntimeError):
+    """Raised when an official benchmark scorer needed by DSPy is unavailable."""
 
 
 @dataclass
@@ -266,6 +271,7 @@ def run_dspy_baseline(
     """Run a direct DSPy program or optimize it with MIPROv2/GEPA, then score outputs."""
 
     config.validate()
+    _ensure_required_official_evaluators(eval_examples, train_examples, val_examples)
     dspy = import_dspy()
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -438,6 +444,34 @@ def import_dspy() -> Any:
             "`python -m pip install -e '.[baselines]'`. The baselines extra "
             "includes DSPy's optuna support for MIPROv2 and DSPy's GEPA dependency."
         ) from exc
+
+
+def _ensure_required_official_evaluators(
+    eval_examples: Sequence[BenchmarkExample],
+    train_examples: Optional[Sequence[BenchmarkExample]],
+    val_examples: Optional[Sequence[BenchmarkExample]],
+) -> None:
+    example_sets = (eval_examples, train_examples or (), val_examples or ())
+    needs_ifbench = any(
+        example.benchmark_id == "ifbench" and example.metric == MetricKind.OFFICIAL_EVALUATOR
+        for examples in example_sets
+        for example in examples
+    )
+    if not needs_ifbench:
+        return
+
+    details = ifbench_evaluator_missing_details()
+    if details is None:
+        return
+
+    install = details.get("install")
+    missing_module = details.get("missing_module")
+    message = f"{details['reason']}."
+    if missing_module:
+        message += f" Missing module: {missing_module}."
+    if install:
+        message += f" Install it with `{install}` before running IFBench baselines."
+    raise MissingBenchmarkEvaluatorError(message)
 
 
 def configure_lm(dspy: Any, config: DSPyMIPROConfig) -> Any:
