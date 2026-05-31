@@ -59,6 +59,23 @@ class SlowProgram(FakeProgram):
         return super().__call__(**kwargs)
 
 
+class AdapterParseError(Exception):
+    pass
+
+
+class ParseFailingProgram(FakeProgram):
+    def __call__(self, **kwargs):
+        raise AdapterParseError(
+            "Adapter JSONAdapter failed to parse the LM response. "
+            "Expected to find output fields in the LM response: [reasoning, answer]"
+        )
+
+
+class RuntimeFailingProgram(FakeProgram):
+    def __call__(self, **kwargs):
+        raise RuntimeError("provider unavailable")
+
+
 class FakeMIPROv2:
     instances = []
 
@@ -223,6 +240,46 @@ def test_dspy_evaluation_uses_worker_concurrency():
 
     assert stats.requested_workers == 3
     assert stats.max_in_flight == 3
+
+
+def test_dspy_evaluation_scores_parse_errors_as_failed_predictions():
+    predictions, scores, stats = _evaluate_program_with_stats(
+        ParseFailingProgram("question -> answer"),
+        [numeric_example()],
+        workers=1,
+        show_progress=False,
+    )
+
+    assert stats.max_in_flight == 1
+    assert predictions == [
+        {
+            "example_id": "gsm8k:test:0",
+            "benchmark_id": "gsm8k",
+            "prediction": "",
+            "raw_prediction": {
+                "error": {
+                    "type": "AdapterParseError",
+                    "message": (
+                        "Adapter JSONAdapter failed to parse the LM response. "
+                        "Expected to find output fields in the LM response: [reasoning, answer]"
+                    ),
+                }
+            },
+        }
+    ]
+    assert scores[0].score == 0.0
+    assert scores[0].passed is False
+    assert scores[0].details["prediction_error"]["type"] == "AdapterParseError"
+
+
+def test_dspy_evaluation_reraises_non_parse_errors():
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        _evaluate_program_with_stats(
+            RuntimeFailingProgram("question -> answer"),
+            [numeric_example()],
+            workers=1,
+            show_progress=False,
+        )
 
 
 def test_mipro_baseline_invokes_official_compile_shape(tmp_path, monkeypatch):

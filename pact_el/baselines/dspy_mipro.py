@@ -786,7 +786,7 @@ def _evaluate_program_with_stats(
         )
         if workers == 1:
             for index, example in enumerate(examples):
-                row, score = evaluate_tracked(index, example)
+                index, row, score = evaluate_tracked(index, example)
                 _record_evaluation_result(
                     index,
                     row,
@@ -837,20 +837,34 @@ def _evaluate_one_program(
     allow_code_execution: bool,
     prediction_field: str,
 ) -> Tuple[int, Dict[str, Any], ScoreResult]:
-    raw_prediction = program(question=example.prompt)
-    prediction = _prediction_text(raw_prediction, field=prediction_field)
+    prediction_error: Optional[Dict[str, str]] = None
+    try:
+        raw_prediction = program(question=example.prompt)
+        prediction = _prediction_text(raw_prediction, field=prediction_field)
+        raw_prediction_json = _json_safe_prediction(raw_prediction)
+    except Exception as exc:
+        if not _is_recoverable_prediction_error(exc):
+            raise
+        prediction = ""
+        prediction_error = _prediction_error_details(exc)
+        raw_prediction_json = {"error": prediction_error}
     score = score_prediction(
         example,
         prediction,
         allow_code_execution=allow_code_execution,
     )
+    if prediction_error is not None:
+        score.details = {
+            **score.details,
+            "prediction_error": prediction_error,
+        }
     return (
         index,
         {
             "example_id": example.example_id,
             "benchmark_id": example.benchmark_id,
             "prediction": prediction,
-            "raw_prediction": _json_safe_prediction(raw_prediction),
+            "raw_prediction": raw_prediction_json,
         },
         score,
     )
@@ -953,6 +967,26 @@ def _json_safe_prediction(prediction: Any) -> Any:
             if not key.startswith("_")
         }
     return str(prediction)
+
+
+def _is_recoverable_prediction_error(exc: Exception) -> bool:
+    if exc.__class__.__name__ == "AdapterParseError":
+        return True
+    message = str(exc)
+    return (
+        "Adapter JSONAdapter failed to parse" in message
+        or (
+            "Expected to find output fields" in message
+            and "Actual output fields parsed" in message
+        )
+    )
+
+
+def _prediction_error_details(exc: Exception) -> Dict[str, str]:
+    return {
+        "type": exc.__class__.__name__,
+        "message": _truncate_text(str(exc), limit=2000),
+    }
 
 
 def _lm_history_count(lm: Any) -> Optional[int]:
