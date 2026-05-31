@@ -89,8 +89,9 @@ class EvidenceLedger(StrictModel):
     def to_optimizer_table(self) -> List[Dict[str, Any]]:
         """Return a JSON-serializable table for the optimizer prompt."""
 
-        return [
-            {
+        rows: List[Dict[str, Any]] = []
+        for row in self.rows:
+            payload = {
                 "evidence_id": row.evidence_id,
                 "source": row.source.value,
                 "input": row.input,
@@ -106,8 +107,11 @@ class EvidenceLedger(StrictModel):
                 "confidence": row.confidence,
                 "prompt_fixability": row.prompt_fixability,
             }
-            for row in self.rows
-        ]
+            metadata = _compact_optimizer_metadata(row.metadata)
+            if metadata:
+                payload["metadata"] = metadata
+            rows.append(payload)
+        return rows
 
     def compact_summary(self) -> Dict[str, Any]:
         return {
@@ -116,7 +120,36 @@ class EvidenceLedger(StrictModel):
             "failures": len(self.failures),
             "suspected_area_counts": self.suspected_area_counts(),
             "weighted_failure_score_by_area": self.weighted_failure_score_by_area(),
+            "failure_family_counts": self.failure_family_counts(),
+            "failed_instruction_id_counts": self.failed_instruction_id_counts(),
+            "top_failure_diagnostics": self.top_failure_diagnostics(),
         }
+
+    def failed_instruction_id_counts(self) -> Dict[str, int]:
+        counter: Counter[str] = Counter()
+        for row in self.failures:
+            for instruction_id in _metadata_list(row.metadata, "failed_instruction_ids"):
+                counter[str(instruction_id)] += 1
+        return dict(counter.most_common(20))
+
+    def failure_family_counts(self) -> Dict[str, int]:
+        counter: Counter[str] = Counter()
+        for instruction_id, count in self.failed_instruction_id_counts().items():
+            family = instruction_id.split(":", 1)[0]
+            counter[family] += count
+        return dict(counter.most_common(20))
+
+    def top_failure_diagnostics(self, limit: int = 12) -> List[str]:
+        diagnostics: Counter[str] = Counter()
+        for row in self.failures:
+            summary = (
+                row.metadata.get("diagnostics", {}).get("summary")
+                if isinstance(row.metadata.get("diagnostics"), Mapping)
+                else None
+            )
+            if summary:
+                diagnostics[str(summary)] += 1
+        return [summary for summary, _count in diagnostics.most_common(limit)]
 
 
 def _guess_area(value: Optional[str]) -> Optional[ContractArea]:
@@ -139,6 +172,65 @@ def _guess_severity(value: Any, default: Severity = Severity.MEDIUM) -> Severity
         if severity.value == normalized:
             return severity
     return default
+
+
+def _metadata_list(metadata: Mapping[str, Any], key: str) -> List[Any]:
+    value = metadata.get(key)
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _compact_optimizer_metadata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep useful diagnostics while preventing giant raw rows in prompts."""
+
+    keep_keys = {
+        "benchmark_id",
+        "example_id",
+        "metric",
+        "score",
+        "passed",
+        "diagnostics",
+        "answer_aliases",
+        "choices",
+        "instruction_constraints",
+        "failed_instruction_ids",
+        "public_tests",
+    }
+    compact: Dict[str, Any] = {}
+    for key in keep_keys:
+        if key not in metadata:
+            continue
+        compact[key] = _truncate_optimizer_value(metadata[key])
+    return compact
+
+
+def _truncate_optimizer_value(value: Any, *, max_chars: int = 1200, depth: int = 3) -> Any:
+    if depth <= 0:
+        text = str(value)
+        return text if len(text) <= max_chars else text[:max_chars] + "...[truncated]"
+    if isinstance(value, Mapping):
+        return {
+            str(key): _truncate_optimizer_value(item, max_chars=max_chars, depth=depth - 1)
+            for key, item in list(value.items())[:20]
+        }
+    if isinstance(value, list):
+        return [
+            _truncate_optimizer_value(item, max_chars=max_chars, depth=depth - 1)
+            for item in value[:20]
+        ]
+    if isinstance(value, tuple):
+        return [
+            _truncate_optimizer_value(item, max_chars=max_chars, depth=depth - 1)
+            for item in value[:20]
+        ]
+    if isinstance(value, str):
+        return value if len(value) <= max_chars else value[:max_chars] + "...[truncated]"
+    return value
 
 
 def build_evidence_ledger(
@@ -305,4 +397,3 @@ def evidence_from_probe_outputs(
             )
         )
     return rows
-

@@ -110,6 +110,7 @@ def print_run_summary(summary: Mapping[str, Any]) -> None:
         "num_threads",
         "accepted",
         "decision",
+        "selected_prompt",
         "accuracy",
         "mean_score",
         "passed",

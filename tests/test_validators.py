@@ -66,3 +66,15 @@ def test_regex_must_not_match_fails_when_forbidden_text_present():
 
     assert not result.passed
 
+
+def test_regex_validator_accepts_string_dotall_flag_alias():
+    context = ValidationContext(input={}, output="alpha\nbeta")
+    spec = ValidatorSpec(
+        validator_id="dotall",
+        kind=ValidatorKind.REGEX,
+        config={"pattern": "alpha.*beta", "field": "output_text", "flags": "s"},
+    )
+
+    [result] = validate_specs([spec], context)
+
+    assert result.passed

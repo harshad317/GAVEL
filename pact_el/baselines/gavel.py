@@ -35,7 +35,7 @@ from pact_el.clients import (
     TargetClient,
 )
 from pact_el.optimize import pact_optimize
-from pact_el.renderer import estimate_token_count
+from pact_el.renderer import estimate_token_count, render_prompt
 from pact_el.schemas import CallRecord, CallRole, ContractArea
 
 
@@ -58,6 +58,9 @@ class GavelConfig:
     workers: int = 1
     budget: int = 9
     allow_one_repair: bool = True
+    validation_gate: bool = True
+    validate_rejected_candidates: bool = True
+    validation_margin: float = 0.0
     allow_code_execution: bool = False
     show_progress: bool = True
     base_prompt: Optional[str] = None
@@ -69,6 +72,8 @@ class GavelConfig:
             raise ValueError("workers must be at least 1")
         if self.budget < 1:
             raise ValueError("budget must be at least 1")
+        if self.validation_margin < 0 or self.validation_margin > 1:
+            raise ValueError("validation_margin must be between 0 and 1")
 
 
 @dataclass
@@ -88,6 +93,35 @@ class EvaluationStats:
 
     requested_workers: int
     max_in_flight: int = 0
+
+
+@dataclass
+class PromptSelection:
+    """Validation-gated prompt selected for final benchmark evaluation."""
+
+    prompt: str
+    selected_variant: str
+    decision: str
+    reason: str
+    api_calls: int = 0
+    base_summary: Optional[Dict[str, Any]] = None
+    candidate_summary: Optional[Dict[str, Any]] = None
+    margin: float = 0.0
+    enabled: bool = True
+    candidate_source: str = "accepted"
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "selected_prompt": self.selected_variant,
+            "decision": self.decision,
+            "reason": self.reason,
+            "api_calls": self.api_calls,
+            "margin": self.margin,
+            "candidate_source": self.candidate_source,
+            "base": self.base_summary,
+            "candidate": self.candidate_summary,
+        }
 
 
 async def run_gavel_baseline(
@@ -146,7 +180,30 @@ async def run_gavel_baseline(
         allow_one_repair=config.allow_one_repair,
         canary_concurrency=config.workers,
     )
-    optimized_prompt = report.rendered_prompt
+    candidate_prompt, candidate_source = _selection_candidate_prompt(
+        report,
+        base_prompt=base_prompt,
+        validate_rejected_candidates=config.validate_rejected_candidates,
+    )
+    prompt_selection = await _select_prompt_with_validation(
+        base_prompt=base_prompt,
+        candidate_prompt=candidate_prompt,
+        candidate_source=candidate_source,
+        report_decision=report.decision.value,
+        report_accepted=report.accepted,
+        val_examples=val_examples,
+        target_client=target_client,
+        allow_code_execution=config.allow_code_execution,
+        show_progress=config.show_progress,
+        workers=config.workers,
+        enabled=config.validation_gate,
+        margin=config.validation_margin,
+    )
+    report.metadata = {
+        **report.metadata,
+        "validation_gate": prompt_selection.summary(),
+    }
+    optimized_prompt = prompt_selection.prompt
 
     split_evaluations = await _evaluate_report_splits(
         prompt=optimized_prompt,
@@ -173,7 +230,11 @@ async def run_gavel_baseline(
         split_name: split_eval["summary"]
         for split_name, split_eval in split_evaluations.items()
     }
-    optimization_api_calls = len(train_examples) + report.call_ledger.total_calls
+    optimization_api_calls = (
+        len(train_examples)
+        + report.call_ledger.total_calls
+        + prompt_selection.api_calls
+    )
     split_results["optimization"] = {
         "score": None,
         "stddev": None,
@@ -207,8 +268,10 @@ async def run_gavel_baseline(
         "max_in_flight": max_in_flight,
         "cache": config.cache,
         "budget": config.budget,
-        "accepted": report.accepted,
-        "decision": report.decision.value,
+        "accepted": prompt_selection.selected_variant == "optimized",
+        "decision": prompt_selection.decision,
+        "selected_prompt": prompt_selection.selected_variant,
+        "validation_gate": prompt_selection.summary(),
         "optimization_api_calls": optimization_api_calls,
         "predictions_path": str(predictions_path),
         "scores_path": str(scores_path),
@@ -364,18 +427,24 @@ def default_base_prompt(spec: Optional[BenchmarkSpec] = None) -> str:
     lines = [
         "You are a precise benchmark-solving assistant.",
         "Follow the user's instruction exactly.",
+        "Before answering, identify all explicit constraints in the prompt, especially output format, length, ordering, and prohibited content.",
+        "Satisfy the requested output shape before adding any optional explanation.",
         "Do not add extra commentary unless the user explicitly asks for it.",
     ]
     if task_type == BenchmarkTaskType.MATH:
-        lines.append("Solve the problem carefully and put the final answer at the end.")
+        lines.append("Solve the problem carefully and put the final answer on its own final line as `Answer: <answer>`.")
     elif task_type == BenchmarkTaskType.INSTRUCTION_FOLLOWING:
-        lines.append("Satisfy every explicit output constraint in the instruction.")
+        lines.append("Satisfy every explicit output constraint in the instruction, including counts, casing, delimiters, required words, forbidden words, and ordering.")
+        lines.append("Privately convert the instruction into a checklist before drafting; treat word, sentence, line, ratio, repetition, and position constraints as hard requirements.")
+        lines.append("For count or ratio constraints, choose a simple structure that makes counting easy, then revise until the requested counts and proportions are exact.")
+        lines.append("For word-property constraints such as vowels, consonants, syllables, first/last letters, alphabetical order, or repeated spans, use only words you can verify against that property.")
+        lines.append("For formatting constraints such as quotes, indentation, options, title case, whitespace, newlines, bullets, or emoji, make the final answer match the requested surface form exactly.")
     elif task_type == BenchmarkTaskType.MULTIPLE_CHOICE:
-        lines.append("Return the single best answer choice letter.")
+        lines.append("Return only the single best answer choice letter unless the prompt explicitly requests explanation.")
     elif task_type == BenchmarkTaskType.CODE_GENERATION:
-        lines.append("Return only executable code with no markdown fences.")
+        lines.append("Return only complete executable Python code with no markdown fences, no prose, and no copied tests unless the prompt asks for tests.")
     elif task_type == BenchmarkTaskType.QUESTION_ANSWERING:
-        lines.append("Answer using only the provided context when context is present.")
+        lines.append("Answer using only the provided context when context is present, and preserve names, numbers, dates, and units exactly.")
     elif task_type == BenchmarkTaskType.TRUTHFULNESS:
         lines.append("If a premise is false or unsupported, answer truthfully and avoid imitation of common falsehoods.")
     return "\n".join(lines)
@@ -496,6 +565,166 @@ class CachedOptimizerClient:
         return response
 
 
+async def _select_prompt_with_validation(
+    *,
+    base_prompt: str,
+    candidate_prompt: str,
+    candidate_source: str,
+    report_decision: str,
+    report_accepted: bool,
+    val_examples: Sequence[BenchmarkExample],
+    target_client: TargetClient,
+    allow_code_execution: bool,
+    show_progress: bool,
+    workers: int,
+    enabled: bool,
+    margin: float,
+) -> PromptSelection:
+    if not enabled:
+        selected_variant = "optimized" if report_accepted else "base"
+        return PromptSelection(
+            prompt=candidate_prompt if selected_variant == "optimized" else base_prompt,
+            selected_variant=selected_variant,
+            decision=report_decision,
+            reason="validation gate disabled",
+            margin=margin,
+            enabled=False,
+            candidate_source=candidate_source,
+        )
+    if not report_accepted and candidate_source == "none":
+        return PromptSelection(
+            prompt=base_prompt,
+            selected_variant="base",
+            decision=report_decision,
+            reason="optimizer patch was rejected and no validation candidate is available",
+            margin=margin,
+            candidate_source=candidate_source,
+        )
+    if not val_examples:
+        return PromptSelection(
+            prompt=candidate_prompt,
+            selected_variant="optimized",
+            decision=report_decision,
+            reason="no validation examples available",
+            margin=margin,
+            candidate_source=candidate_source,
+        )
+    if candidate_prompt.strip() == base_prompt.strip():
+        return PromptSelection(
+            prompt=base_prompt,
+            selected_variant="base",
+            decision=report_decision,
+            reason="candidate prompt matches base prompt",
+            margin=margin,
+            candidate_source=candidate_source,
+        )
+
+    base_predictions, base_scores, base_stats = await evaluate_prompt(
+        prompt=base_prompt,
+        examples=val_examples,
+        target_client=target_client,
+        allow_code_execution=allow_code_execution,
+        show_progress=show_progress,
+        workers=workers,
+        description="GAVEL validation gate/base",
+        phase="validation_gate_base",
+    )
+    del base_predictions
+    candidate_predictions, candidate_scores, candidate_stats = await evaluate_prompt(
+        prompt=candidate_prompt,
+        examples=val_examples,
+        target_client=target_client,
+        allow_code_execution=allow_code_execution,
+        show_progress=show_progress,
+        workers=workers,
+        description="GAVEL validation gate/candidate",
+        phase="validation_gate_candidate",
+    )
+    del candidate_predictions
+
+    base_summary = _split_result_summary(
+        base_scores,
+        examples=len(val_examples),
+        api_calls=len(val_examples),
+        stats=base_stats,
+    )
+    candidate_summary = _split_result_summary(
+        candidate_scores,
+        examples=len(val_examples),
+        api_calls=len(val_examples),
+        stats=candidate_stats,
+    )
+    api_calls = len(val_examples) * 2
+    base_metric = _selection_metric(base_summary)
+    candidate_metric = _selection_metric(candidate_summary)
+    if base_metric is None or candidate_metric is None:
+        selected_variant = "optimized" if report_accepted else "base"
+        return PromptSelection(
+            prompt=candidate_prompt if selected_variant == "optimized" else base_prompt,
+            selected_variant=selected_variant,
+            decision=report_decision if report_accepted else "validation_unscored_rollback",
+            reason="validation scorer produced no comparable metric",
+            api_calls=api_calls,
+            base_summary=base_summary,
+            candidate_summary=candidate_summary,
+            margin=margin,
+            candidate_source=candidate_source,
+        )
+    if candidate_metric + 1e-12 >= base_metric + margin:
+        decision = report_decision if report_accepted else "validation_override"
+        return PromptSelection(
+            prompt=candidate_prompt,
+            selected_variant="optimized",
+            decision=decision,
+            reason=(
+                f"candidate validation metric {candidate_metric:.4f} met "
+                f"base {base_metric:.4f} with margin {margin:.4f}"
+            ),
+            api_calls=api_calls,
+            base_summary=base_summary,
+            candidate_summary=candidate_summary,
+            margin=margin,
+            candidate_source=candidate_source,
+        )
+    return PromptSelection(
+        prompt=base_prompt,
+        selected_variant="base",
+        decision="validation_rollback",
+        reason=(
+            f"candidate validation metric {candidate_metric:.4f} fell below "
+            f"base {base_metric:.4f} with margin {margin:.4f}"
+        ),
+        api_calls=api_calls,
+        base_summary=base_summary,
+        candidate_summary=candidate_summary,
+        margin=margin,
+        candidate_source=candidate_source,
+    )
+
+
+def _selection_candidate_prompt(
+    report: Any,
+    *,
+    base_prompt: str,
+    validate_rejected_candidates: bool,
+) -> tuple[str, str]:
+    if report.accepted:
+        return report.rendered_prompt, "accepted"
+    if not validate_rejected_candidates or report.graph is None or report.patch is None:
+        return base_prompt, "none"
+    return render_prompt(report.graph, source_prompt=base_prompt, patch=report.patch), "rejected"
+
+
+def _selection_metric(summary: Mapping[str, Any]) -> Optional[float]:
+    score = summary.get("score")
+    if score is not None:
+        return float(score)
+    accuracy = summary.get("accuracy")
+    if accuracy is not None:
+        return float(accuracy)
+    return None
+
+
 async def _evaluate_report_splits(
     *,
     prompt: str,
@@ -589,42 +818,309 @@ def _evidence_logs(
     for example in examples:
         score = score_by_id.get(example.example_id)
         prediction = prediction_by_id.get(example.example_id)
-        passed = bool(score and score.passed is True)
+        passed = None if score is None or score.passed is None else bool(score.passed)
+        metadata = _evidence_metadata(example, score)
         logs.append(
             {
                 "evidence_id": f"train_{example.example_id}",
                 "input": example.prompt,
-                "expected": _expected_behavior(example),
-                "observed": prediction,
+                "expected": _expected_behavior(example, score),
+                "observed": _observed_behavior(prediction, score),
                 "output": prediction,
                 "passed": passed,
-                "severity": "low" if passed else "high",
-                "area": _contract_area(example).value,
-                "confidence": 0.8 if score and score.score is not None else 0.5,
-                "prompt_fixability": 0.4 if passed else 0.8,
-                "metadata": {
-                    "benchmark_id": example.benchmark_id,
-                    "example_id": example.example_id,
-                    "metric": example.metric.value,
-                    "score": None if score is None else score.model_dump(mode="json"),
-                },
+                "severity": _evidence_severity(score),
+                "area": _contract_area(example, score).value,
+                "confidence": _evidence_confidence(score),
+                "prompt_fixability": _prompt_fixability(example, score),
+                "metadata": metadata,
             }
         )
     return logs
 
 
-def _expected_behavior(example: BenchmarkExample) -> str:
+def _expected_behavior(example: BenchmarkExample, score: Optional[ScoreResult]) -> str:
     if example.metric == MetricKind.OFFICIAL_EVALUATOR:
-        return "Satisfy the benchmark's official evaluator for this instruction."
+        parts = ["Satisfy every official-evaluator instruction constraint for this prompt."]
+        constraints = _instruction_constraints(example)
+        failed_constraints = _failed_instruction_ids(score)
+        if constraints:
+            parts.append("Instruction constraints: " + "; ".join(constraints))
+        if failed_constraints:
+            parts.append("Observed output failed these constraints: " + ", ".join(failed_constraints))
+        return " ".join(parts)
     if example.metric == MetricKind.PASS_AT_1:
-        return "Generate code that passes the official unit tests."
+        tests = _public_tests(example)
+        if tests:
+            return (
+                "Generate complete Python code that satisfies the specification and "
+                "passes the public unit tests: " + " | ".join(tests)
+            )
+        return "Generate complete Python code that passes the official unit tests."
     if example.choices:
-        return f"Return the correct answer choice. Expected: {example.expected_answer}"
+        choices = "; ".join(_choice_lines(example))
+        return (
+            f"Return exactly one answer choice label. Expected: {example.expected_answer}. "
+            f"Choices: {choices}"
+        )
+    aliases = _answer_aliases(example)
+    if aliases:
+        return "Expected answer aliases: " + "; ".join(aliases)
     return f"Expected answer: {example.expected_answer}"
 
 
-def _contract_area(example: BenchmarkExample) -> ContractArea:
+def _observed_behavior(prediction: Any, score: Optional[ScoreResult]) -> str:
+    output = _truncate_text("" if prediction is None else str(prediction), max_chars=1600)
+    if score is None:
+        return f"Observed output: {output}"
+    if score.passed is True:
+        return f"Observed output passed scorer: {output}"
+    diagnostics = _score_failure_summary(score)
+    if diagnostics:
+        return f"Observed output: {output}\nScorer diagnostics: {diagnostics}"
+    return f"Observed output: {output}\nScorer marked the output as failing."
+
+
+def _evidence_metadata(
+    example: BenchmarkExample,
+    score: Optional[ScoreResult],
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {
+        "benchmark_id": example.benchmark_id,
+        "example_id": example.example_id,
+        "metric": example.metric.value,
+        "score": None if score is None else score.score,
+        "passed": None if score is None else score.passed,
+        "diagnostics": _score_diagnostics(score),
+    }
+    constraints = _instruction_constraints(example)
+    if constraints:
+        metadata["instruction_constraints"] = constraints
+    failed_constraints = _failed_instruction_ids(score)
+    if failed_constraints:
+        metadata["failed_instruction_ids"] = failed_constraints
+    if example.choices:
+        metadata["choices"] = _choice_lines(example)
+    if example.metric != MetricKind.PASS_AT_1:
+        aliases = _answer_aliases(example)
+        if aliases:
+            metadata["answer_aliases"] = aliases
+    tests = _public_tests(example)
+    if tests:
+        metadata["public_tests"] = tests
+    return metadata
+
+
+def _score_diagnostics(score: Optional[ScoreResult]) -> Dict[str, Any]:
+    if score is None:
+        return {"reason": "score missing"}
+    diagnostics: Dict[str, Any] = {
+        "score": score.score,
+        "passed": score.passed,
+    }
+    summary = _score_failure_summary(score)
+    if summary:
+        diagnostics["summary"] = summary
+    details = _compact_score_details(score.details)
+    if details:
+        diagnostics["details"] = details
+    return diagnostics
+
+
+def _score_failure_summary(score: Optional[ScoreResult]) -> str:
+    if score is None:
+        return ""
+    details = score.details or {}
+    parts: List[str] = []
+    if details.get("reason"):
+        parts.append(str(details["reason"]))
+    if "observed_number" in details or "expected_number" in details:
+        parts.append(
+            f"observed_number={details.get('observed_number')!r}, "
+            f"expected_number={details.get('expected_number')!r}"
+        )
+    if "observed_choice" in details or "expected_choice" in details:
+        parts.append(
+            f"observed_choice={details.get('observed_choice')!r}, "
+            f"expected_choice={details.get('expected_choice')!r}"
+        )
+    if "best_f1" in details:
+        parts.append(f"best_f1={details.get('best_f1')!r}")
+    failed_constraints = _failed_instruction_ids(score)
+    if failed_constraints:
+        parts.append("failed_instruction_ids=" + ", ".join(failed_constraints))
+    if details.get("stderr"):
+        parts.append("stderr=" + _truncate_text(str(details["stderr"]), max_chars=600))
+    if details.get("stdout"):
+        parts.append("stdout=" + _truncate_text(str(details["stdout"]), max_chars=300))
+    if score.score is not None and not parts:
+        parts.append(f"score={score.score}")
+    return "; ".join(parts)
+
+
+def _compact_score_details(details: Mapping[str, Any]) -> Dict[str, Any]:
+    keep = (
+        "reason",
+        "observed_number",
+        "expected_number",
+        "observed_choice",
+        "expected_choice",
+        "aliases",
+        "best_f1",
+        "instruction_id_list",
+        "follow_instruction_list",
+        "returncode",
+        "stderr",
+        "stdout",
+        "evaluator",
+    )
+    compact: Dict[str, Any] = {}
+    for key in keep:
+        if key in details:
+            compact[key] = _compact_value(details[key])
+    return compact
+
+
+def _compact_value(value: Any, *, max_chars: int = 800) -> Any:
+    if isinstance(value, str):
+        return _truncate_text(value, max_chars=max_chars)
+    if isinstance(value, list):
+        return [_compact_value(item, max_chars=max_chars) for item in value[:20]]
+    if isinstance(value, tuple):
+        return [_compact_value(item, max_chars=max_chars) for item in value[:20]]
+    if isinstance(value, Mapping):
+        return {
+            str(key): _compact_value(item, max_chars=max_chars)
+            for key, item in list(value.items())[:20]
+        }
+    return value
+
+
+def _instruction_constraints(example: BenchmarkExample) -> List[str]:
+    ids = list(example.metadata.get("instruction_id_list") or [])
+    kwargs_list = list(example.metadata.get("kwargs") or [])
+    official_row = example.metadata.get("official_input_row") or {}
+    if not ids:
+        ids = list(official_row.get("instruction_id_list") or [])
+    if not kwargs_list:
+        kwargs_list = list(official_row.get("kwargs") or [])
+    constraints: List[str] = []
+    for index, instruction_id in enumerate(ids[:12]):
+        raw_kwargs = kwargs_list[index] if index < len(kwargs_list) else {}
+        kwargs = {
+            str(key): value
+            for key, value in dict(raw_kwargs or {}).items()
+            if value is not None
+        }
+        if kwargs:
+            rendered_kwargs = ", ".join(
+                f"{key}={_truncate_text(str(value), max_chars=120)!r}"
+                for key, value in sorted(kwargs.items())
+            )
+            constraints.append(f"{instruction_id}({rendered_kwargs})")
+        else:
+            constraints.append(str(instruction_id))
+    return constraints
+
+
+def _failed_instruction_ids(score: Optional[ScoreResult]) -> List[str]:
+    if score is None:
+        return []
+    details = score.details or {}
+    ids = list(details.get("instruction_id_list") or [])
+    followed = list(details.get("follow_instruction_list") or [])
+    failed: List[str] = []
+    for instruction_id, did_follow in zip(ids, followed):
+        if did_follow is False:
+            failed.append(str(instruction_id))
+    return failed
+
+
+def _choice_lines(example: BenchmarkExample) -> List[str]:
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return [
+        f"{labels[index]}: {_truncate_text(str(choice), max_chars=240)}"
+        for index, choice in enumerate(example.choices)
+    ]
+
+
+def _answer_aliases(example: BenchmarkExample) -> List[str]:
+    aliases = example.metadata.get("answer_aliases") or example.metadata.get("correct_answers")
+    if aliases:
+        return [_truncate_text(str(alias), max_chars=240) for alias in aliases[:20]]
+    if example.expected_answer is not None:
+        return [_truncate_text(str(example.expected_answer), max_chars=240)]
+    return []
+
+
+def _public_tests(example: BenchmarkExample) -> List[str]:
+    tests = list(example.metadata.get("test_imports", [])) + list(
+        example.metadata.get("test_list", [])
+    )
+    return [_truncate_text(str(test), max_chars=300) for test in tests[:8]]
+
+
+def _evidence_severity(score: Optional[ScoreResult]) -> str:
+    if score is None or score.score is None:
+        return "medium"
+    if score.passed is True:
+        return "low"
+    if float(score.score) > 0:
+        return "medium"
+    return "high"
+
+
+def _evidence_confidence(score: Optional[ScoreResult]) -> float:
+    if score is None or score.score is None:
+        return 0.45
+    return 0.9
+
+
+def _prompt_fixability(
+    example: BenchmarkExample,
+    score: Optional[ScoreResult],
+) -> float:
+    if score is None or score.passed is None:
+        return 0.3
+    if score.passed is True:
+        return 0.2
     if example.metric == MetricKind.OFFICIAL_EVALUATOR:
+        return 0.9
+    if example.metric == MetricKind.MULTIPLE_CHOICE_ACCURACY:
+        return 0.75
+    if example.metric == MetricKind.PASS_AT_1:
+        return 0.7
+    if example.metric in {MetricKind.EXACT_MATCH, MetricKind.TOKEN_F1}:
+        return 0.65
+    if example.metric == MetricKind.NUMERIC_EXACT:
+        return 0.7
+    return 0.6
+
+
+def _truncate_text(value: str, *, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "...[truncated]"
+
+
+def _contract_area(
+    example: BenchmarkExample,
+    score: Optional[ScoreResult] = None,
+) -> ContractArea:
+    if example.metric == MetricKind.OFFICIAL_EVALUATOR:
+        failed_families = {
+            instruction_id.split(":", 1)[0]
+            for instruction_id in _failed_instruction_ids(score)
+        }
+        all_families = {
+            constraint.split(":", 1)[0]
+            for constraint in _instruction_constraints(example)
+            if ":" in constraint
+        }
+        families = failed_families or all_families
+        if families and families <= {"format"}:
+            return ContractArea.FORMATTING_RULE
+        if families & {"count", "ratio", "words", "sentence", "repeat", "custom"}:
+            return ContractArea.PRECEDENCE_RULE
         return ContractArea.FORMATTING_RULE
     if example.metric == MetricKind.PASS_AT_1:
         return ContractArea.TASK_INTENT
@@ -638,7 +1134,8 @@ def _task_spec(spec: Optional[BenchmarkSpec]) -> str:
         return "Solve each benchmark example according to its prompt."
     return (
         f"Benchmark: {spec.display_name} ({spec.benchmark_id}). "
-        f"Task type: {spec.task_type.value}. {spec.description}"
+        f"Task type: {spec.task_type.value}. {spec.description} "
+        "The optimized prompt must generalize to held-out examples and must not memorize train labels."
     )
 
 
@@ -646,7 +1143,10 @@ def _rubric(spec: Optional[BenchmarkSpec]) -> str:
     if spec is None:
         return "Score each answer with the normalized benchmark scorer."
     metrics = ", ".join(metric.value for metric in spec.metrics)
-    return f"Metrics: {metrics}. Official evaluator: {spec.evaluator}"
+    return (
+        f"Metrics: {metrics}. Official evaluator: {spec.evaluator}. "
+        "Prefer rules that improve scorer-visible correctness while preserving the prompt's requested output format."
+    )
 
 
 def _write_split_outputs(

@@ -76,6 +76,55 @@ class SlowTargetClient(FakeTargetClient):
         return await super().complete(prompt, input, metadata=metadata)
 
 
+class ValidationRegressionTargetClient(FakeTargetClient):
+    async def complete(
+        self,
+        prompt: str,
+        input: Any,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ClientResponse:
+        del prompt
+        self.calls += 1
+        phase = (metadata or {}).get("phase")
+        if (metadata or {}).get("canary_id"):
+            output = '{"priority": "urgent"}'
+        elif phase == "validation_gate_candidate":
+            output = "5"
+        else:
+            output = "4" if "2+2" in str(input) else "A"
+        return ClientResponse(
+            output=output,
+            raw=output,
+            call_record=_record(CallRole.TARGET, "target_complete", metadata),
+        )
+
+
+class RejectedCandidateValidationTargetClient(FakeTargetClient):
+    async def complete(
+        self,
+        prompt: str,
+        input: Any,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ClientResponse:
+        self.calls += 1
+        phase = (metadata or {}).get("phase")
+        if (metadata or {}).get("canary_id"):
+            output = "not valid json"
+        elif phase == "validation_gate_base":
+            output = "5"
+        elif phase == "validation_gate_candidate" and "PACT-EL Behavioral Contract" in prompt:
+            output = "4"
+        elif "2+2" in str(input):
+            output = "4" if "PACT-EL Behavioral Contract" in prompt else "5"
+        else:
+            output = "A"
+        return ClientResponse(
+            output=output,
+            raw=output,
+            call_record=_record(CallRole.TARGET, "target_complete", metadata),
+        )
+
+
 def _record(
     role: CallRole,
     name: str,
@@ -157,6 +206,72 @@ async def test_gavel_baseline_compiles_and_reports_splits(tmp_path, sample_compi
     assert result.prompt_path.exists()
 
 
+@pytest.mark.asyncio
+async def test_gavel_validation_gate_rolls_back_regressing_prompt(tmp_path, sample_compiler_output):
+    config = GavelConfig(
+        model="fake-target",
+        optimizer_model="fake-optimizer",
+        output_dir=tmp_path,
+        cache=False,
+        workers=2,
+        show_progress=False,
+        validation_gate=True,
+    )
+    result = await run_gavel_baseline(
+        train_examples=[_numeric_example("gsm8k:train:0")],
+        val_examples=[_numeric_example("gsm8k:validation:0")],
+        test_examples=[_numeric_example("gsm8k:test:0")],
+        config=config,
+        benchmark_spec=_spec(),
+        optimizer_client=FakeOptimizerClient(sample_compiler_output.model_dump_json()),
+        target_client=ValidationRegressionTargetClient(),
+    )
+
+    gate = result.summary["validation_gate"]
+    assert result.summary["selected_prompt"] == "base"
+    assert result.summary["accepted"] is False
+    assert result.summary["decision"] == "validation_rollback"
+    assert gate["base"]["score"] == 1.0
+    assert gate["candidate"]["score"] == 0.0
+    assert result.summary["split_results"]["test"]["score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_gavel_validation_gate_can_override_synthetic_canary_rejection(
+    tmp_path,
+    sample_compiler_output,
+):
+    config = GavelConfig(
+        model="fake-target",
+        optimizer_model="fake-optimizer",
+        output_dir=tmp_path,
+        cache=False,
+        workers=2,
+        show_progress=False,
+        allow_one_repair=False,
+        validation_gate=True,
+        validate_rejected_candidates=True,
+    )
+    result = await run_gavel_baseline(
+        train_examples=[_numeric_example("gsm8k:train:0")],
+        val_examples=[_numeric_example("gsm8k:validation:0")],
+        test_examples=[_numeric_example("gsm8k:test:0")],
+        config=config,
+        benchmark_spec=_spec(),
+        optimizer_client=FakeOptimizerClient(sample_compiler_output.model_dump_json()),
+        target_client=RejectedCandidateValidationTargetClient(),
+    )
+
+    gate = result.summary["validation_gate"]
+    assert result.summary["selected_prompt"] == "optimized"
+    assert result.summary["accepted"] is True
+    assert result.summary["decision"] == "validation_override"
+    assert gate["candidate_source"] == "rejected"
+    assert gate["base"]["score"] == 0.0
+    assert gate["candidate"]["score"] == 1.0
+    assert result.summary["split_results"]["test"]["score"] == 1.0
+
+
 def test_default_base_prompt_is_benchmark_specific():
     prompt = default_base_prompt(_spec())
     assert "benchmark-solving" in prompt
@@ -169,6 +284,9 @@ def test_gavel_temperature_validation():
 
     with pytest.raises(ValueError, match="optimizer_temperature must be between 0 and 2"):
         GavelConfig(optimizer_temperature=-0.1).validate()
+
+    with pytest.raises(ValueError, match="validation_margin must be between 0 and 1"):
+        GavelConfig(validation_margin=1.1).validate()
 
 
 @pytest.mark.asyncio

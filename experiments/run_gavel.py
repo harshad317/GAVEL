@@ -88,6 +88,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=9)
     parser.add_argument("--budget", type=int, default=9)
     parser.add_argument("--disable-repair", action="store_true")
+    parser.add_argument(
+        "--disable-validation-gate",
+        action="store_true",
+        help="Skip held-out validation rollback and use the canary-gated GAVEL prompt directly.",
+    )
+    parser.add_argument(
+        "--disable-rejected-candidate-validation",
+        action="store_true",
+        help="Do not validation-score compiler candidates rejected by synthetic canaries.",
+    )
+    parser.add_argument(
+        "--validation-margin",
+        type=float,
+        default=0.0,
+        help="Minimum validation-score improvement required to keep the optimized prompt.",
+    )
     parser.add_argument("--prompt", help="Override the default base prompt.")
     parser.add_argument("--prompt-file", help="Read the base prompt from a file.")
     parser.add_argument(
@@ -139,6 +155,9 @@ async def async_main() -> None:
         workers=args.workers,
         budget=args.budget,
         allow_one_repair=not args.disable_repair,
+        validation_gate=not args.disable_validation_gate,
+        validate_rejected_candidates=not args.disable_rejected_candidate_validation,
+        validation_margin=args.validation_margin,
         allow_code_execution=args.allow_code_execution,
         show_progress=not args.no_progress,
         base_prompt=base_prompt,
@@ -186,6 +205,9 @@ async def async_main() -> None:
                 "workers": args.workers,
                 "cache": cache,
                 "budget": args.budget,
+                "validation_gate": not args.disable_validation_gate,
+                "validate_rejected_candidates": not args.disable_rejected_candidate_validation,
+                "validation_margin": args.validation_margin,
                 "train_n": train_n,
                 "val_n": val_n,
                 "test_n": test_n,

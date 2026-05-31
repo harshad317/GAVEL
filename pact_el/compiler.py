@@ -90,18 +90,32 @@ def build_compiler_messages(
     summary_payload = json.dumps(ledger.compact_summary(), indent=2, sort_keys=True)
     system = (
         "You are the PACT-EL optimizer compiler. Your job is not to rewrite "
-        "the prompt broadly. Infer the broken behavioral contract, represent "
-        "it as a typed Prompt Axiom Graph, apply exactly one minimal AxiomPatch, "
-        "and design four falsification canaries: fix, boundary, regression, "
-        "and format_schema. Return only valid JSON matching the supplied schema."
+        "the prompt broadly. Infer the smallest transferable behavioral contract "
+        "that explains the evidence, represent it as a typed Prompt Axiom Graph, "
+        "apply exactly one minimal AxiomPatch, and design four falsification "
+        "canaries: fix, boundary, regression, and format_schema. Return only "
+        "valid JSON matching the supplied schema."
     )
     user = f"""
 PACT-EL compile request
 
+Objective:
+- Produce a contract patch that transfers to unseen validation and test examples.
+- Improve behavior by adding operational rules, precedence rules, output-shape rules, or uncertainty policies that the target model can execute.
+- Use training labels only to infer reusable behavior. Do not put per-example answers, example ids, memorized labels, or copied training inputs into graph node statements, patch summaries, or rendered-prompt diffs.
+
 Hard rules:
 - Use one patch, not a candidate-search loop.
 - Preserve behavior that is not implicated by the defect posterior.
+- Treat success rows as regression constraints and failure rows as evidence for a general defect.
+- Prefer defects with repeated support, high prompt-fixability, high expected gain, and low regression risk.
+- Distinguish prompt-fixable failures from model-knowledge, tool, retrieval, evaluator, or impossible-constraint failures.
 - Put hard clauses in GuaranteeScript predicates when deterministic validation is possible.
+- GuaranteeScript predicates must use the supported JSONLogic subset only: var, if, and, or, !/not, !!, ==, !=, <, <=, >, >=, in, missing, missing_some, cat, substr, +, -, *, /, %, max, min, all, some, none. Do not invent keys such as type, all_of, clauses, regex, or description inside predicates.
+- Every canary must have at least one deterministic validator, and canary inputs must be fresh stress cases rather than copied evidence rows.
+- Canary inputs, expected_behavior, and validators must be internally consistent. Do not make a canary whose prompt asks for one output while the validator expects a different output.
+- Regex validators must use Python-compatible regular expressions. The flags field, when needed, must be a list such as ["dotall", "ignorecase"].
+- Exact-match validators are only appropriate when the canary prompt fully determines a single exact output. Otherwise use schema, enum, numeric, or regex validators that check the contract without over-constraining content.
 - Do not claim to fix retrieval gaps, missing knowledge, bad tools, invalid upstream data, or impossible constraints.
 - If the evidence is not prompt-fixable, include a no_patch_diagnosis and make the patch a conservative diagnostic patch.
 - Do not output markdown fences or explanatory prose.
@@ -233,4 +247,3 @@ class ContractCompiler:
         if call_ledger is not None:
             call_ledger.add(response.call_record)
         return strict_parse_json_model(RepairOutput, response.output)
-

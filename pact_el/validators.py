@@ -345,12 +345,15 @@ def validate_regex(spec: ValidatorSpec, context: ValidationContext) -> Validator
             message="regex validator requires a pattern",
         )
     flags = 0
-    for flag in spec.config.get("flags", []):
+    raw_flags = spec.config.get("flags", [])
+    if isinstance(raw_flags, str):
+        raw_flags = [raw_flags]
+    for flag in raw_flags:
         if str(flag).lower() == "ignorecase":
             flags |= re.IGNORECASE
         elif str(flag).lower() == "multiline":
             flags |= re.MULTILINE
-        elif str(flag).lower() == "dotall":
+        elif str(flag).lower() in {"dotall", "s"}:
             flags |= re.DOTALL
     value = _field_value({"field": spec.config.get("field", "output_text")}, context)
     text = "" if value is None else str(value)
@@ -549,4 +552,3 @@ def validate_guarantee_script(
         )
         results.append(validate_jsonlogic(validator, context))
     return results
-

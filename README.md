@@ -232,14 +232,20 @@ python3 experiments/run_gavel.py \
   --workers 16 \
   --cache True \
   --budget 9 \
+  --validation-margin 0.0 \
   --out output/baselines/ifbench_gavel
 ```
 
 The GAVEL runner first evaluates the base prompt on the selected train examples
-to build an Evidence Ledger, compiles one PACT-EL/GAVEL prompt, then evaluates
-that optimized prompt on train, validation, and test. It writes prediction
-JSONL, score JSONL, the full GAVEL optimization report, the rendered prompt,
-and a summary JSON.
+to build an Evidence Ledger, compiles one PACT-EL/GAVEL prompt, checks the
+candidate against the held-out validation split, and rolls back to the base
+prompt if the candidate underperforms the validation baseline. The validation
+gate is enabled by default. It can also validation-score candidates rejected by
+synthetic canaries, keeping them only when held-out validation beats the base
+prompt; use `--disable-rejected-candidate-validation` for stricter canary-only
+ablations. The runner then evaluates the selected prompt on train, validation,
+and test. It writes prediction JSONL, score JSONL, the full GAVEL optimization
+report, the selected prompt, and a summary JSON.
 
 ## Architecture
 
@@ -268,3 +274,5 @@ and a summary JSON.
 - Deterministic validators are preferred. LLM judges are represented as counted fallback validators and must be explicitly configured.
 - PACT-EL does not claim to fix missing knowledge, broken tools, bad retrieval, invalid upstream data, or impossible constraints.
 - Patch acceptance requires a supported fix claim and no critical regression.
+- Live benchmark runs add a held-out validation gate after compilation, so a patch that passes synthetic canaries but regresses validation is rolled back before test evaluation, and a canary-rejected candidate can be rescued only by real validation improvement.
+- Optimizer evidence includes compact scorer diagnostics, failed instruction ids, answer aliases, choices, or public tests when available; raw benchmark rows are not copied wholesale into the optimizer prompt.
