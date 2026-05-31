@@ -178,6 +178,24 @@ def summarize_scores(results: Sequence[ScoreResult]) -> Dict[str, Any]:
     return tracker.summary()
 
 
+def summarize_unscored_reasons(results: Sequence[ScoreResult]) -> List[Dict[str, Any]]:
+    reasons: Counter[str] = Counter()
+    details_by_reason: Dict[str, Dict[str, Any]] = {}
+    for result in results:
+        if result.score is not None:
+            continue
+        reason = str(result.details.get("reason") or "score unavailable")
+        reasons[reason] += 1
+        details = details_by_reason.setdefault(reason, {})
+        for key in ("install", "missing_module", "evaluator"):
+            if key in result.details and key not in details:
+                details[key] = result.details[key]
+    return [
+        {"reason": reason, "count": count, **details_by_reason.get(reason, {})}
+        for reason, count in reasons.most_common()
+    ]
+
+
 def _record_score_result(
     index: int,
     result: ScoreResult,

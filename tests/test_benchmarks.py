@@ -18,6 +18,7 @@ from pact_el.benchmarks.scoring import (
     score_prediction,
     score_predictions,
     summarize_scores,
+    summarize_unscored_reasons,
 )
 from pact_el.benchmarks.schemas import BenchmarkExample, MetricKind, ScoreResult
 
@@ -190,6 +191,46 @@ def test_score_accumulator_postfix_reports_unscored_progress():
         "scored": 0,
         "unscored": 1,
     }
+
+
+def test_unscored_reason_summary_keeps_actionable_fix():
+    results = [
+        ScoreResult(
+            example_id="ifbench:test:0",
+            metric=MetricKind.OFFICIAL_EVALUATOR,
+            score=None,
+            passed=None,
+            prediction="",
+            expected=None,
+            details={
+                "reason": "official IFBench evaluator is not installed",
+                "install": "python -m pip install -e '.[ifbench]'",
+                "missing_module": "ifbench",
+            },
+        ),
+        ScoreResult(
+            example_id="ifbench:test:1",
+            metric=MetricKind.OFFICIAL_EVALUATOR,
+            score=None,
+            passed=None,
+            prediction="",
+            expected=None,
+            details={
+                "reason": "official IFBench evaluator is not installed",
+                "install": "python -m pip install -e '.[ifbench]'",
+                "missing_module": "ifbench",
+            },
+        ),
+    ]
+
+    assert summarize_unscored_reasons(results) == [
+        {
+            "reason": "official IFBench evaluator is not installed",
+            "count": 2,
+            "install": "python -m pip install -e '.[ifbench]'",
+            "missing_module": "ifbench",
+        }
+    ]
 
 
 def test_score_predictions_can_use_process_workers():

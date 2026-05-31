@@ -14,7 +14,12 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tqdm.auto import tqdm
 
-from pact_el.benchmarks.scoring import ScoreAccumulator, score_prediction, summarize_scores
+from pact_el.benchmarks.scoring import (
+    ScoreAccumulator,
+    score_prediction,
+    summarize_scores,
+    summarize_unscored_reasons,
+)
 from pact_el.benchmarks.schemas import (
     BenchmarkExample,
     BenchmarkSpec,
@@ -682,6 +687,7 @@ def _split_result_summary(
         "scored": summary["scored"],
         "passed": summary["passed"],
         "unscored": summary["unscored"],
+        "unscored_reasons": summarize_unscored_reasons(scores),
         "workers": None if stats is None else stats.requested_workers,
         "max_in_flight": None if stats is None else stats.max_in_flight,
     }

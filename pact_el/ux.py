@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.traceback import install as install_traceback
@@ -136,18 +137,25 @@ def print_method_results_table(summary: Mapping[str, Any]) -> None:
     table = Table(box=box.ROUNDED, header_style="bold", show_lines=False)
     table.add_column("Split", style="bold cyan")
     table.add_column("Score", justify="right")
+    table.add_column("Accuracy", justify="right")
     table.add_column("StdDev", justify="right")
+    table.add_column("Scored", justify="right")
+    table.add_column("Unscored", justify="right")
     table.add_column("API calls", justify="right")
     for split_name in ("train", "val", "test", "optimization"):
         row = split_results.get(split_name) or {}
         table.add_row(
             split_name,
             _format_float(row.get("score")),
+            _format_percent(row.get("accuracy")),
             _format_float(row.get("stddev")),
+            _format_count(row.get("scored")),
+            _format_count(row.get("unscored")),
             _format_count(row.get("api_calls")),
             style=_score_style(row.get("score")) if split_name != "optimization" else "dim",
         )
     console.print(Panel(table, title=f" {method} ", border_style="magenta", box=box.ROUNDED))
+    _print_scoring_issues(split_results)
 
 
 def print_selection_summary(manifest: Mapping[str, Any]) -> None:
@@ -207,7 +215,50 @@ def _format_float(value: Any) -> str:
     return f"{float(value):.3f}"
 
 
+def _format_percent(value: Any) -> str:
+    if value is None:
+        return "—"
+    return f"{float(value):.2%}"
+
+
 def _format_count(value: Any) -> str:
     if value is None:
         return "—"
     return str(int(value))
+
+
+def _print_scoring_issues(split_results: Mapping[str, Any]) -> None:
+    issue_rows = []
+    for split_name in ("train", "val", "test"):
+        row = split_results.get(split_name) or {}
+        unscored = int(row.get("unscored") or 0)
+        if unscored <= 0:
+            continue
+        reasons = row.get("unscored_reasons") or []
+        if not reasons:
+            issue_rows.append((split_name, str(unscored), "score unavailable", "open scores JSONL"))
+            continue
+        for reason in reasons[:3]:
+            fix = reason.get("install") or (
+                f"missing module: {reason['missing_module']}"
+                if reason.get("missing_module")
+                else "open scores JSONL"
+            )
+            issue_rows.append(
+                (
+                    split_name,
+                    str(reason.get("count", unscored)),
+                    escape(str(reason.get("reason", "score unavailable"))),
+                    escape(str(fix)),
+                )
+            )
+    if not issue_rows:
+        return
+    table = Table(box=box.ROUNDED, header_style="bold yellow")
+    table.add_column("Split", style="bold cyan")
+    table.add_column("Unscored", justify="right", style="yellow")
+    table.add_column("Reason", style="white")
+    table.add_column("Fix", style="green")
+    for row in issue_rows:
+        table.add_row(*row)
+    console.print(Panel(table, title=" Scoring issue ", border_style="yellow", box=box.ROUNDED))

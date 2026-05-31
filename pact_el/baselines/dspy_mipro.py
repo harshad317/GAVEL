@@ -24,6 +24,7 @@ from pact_el.benchmarks.scoring import (
     load_normalized_examples,
     score_prediction,
     summarize_scores,
+    summarize_unscored_reasons,
 )
 from pact_el.benchmarks.schemas import BenchmarkExample, ScoreResult
 
@@ -375,6 +376,7 @@ def run_dspy_baseline(
         "optimizer": config.optimizer,
         "program": config.program,
         "model": config.model,
+        "benchmark": _summary_benchmark(eval_examples, selection_summary),
         "temperature": config.temperature,
         "effective_temperature": _display_temperature(config.temperature),
         "reflection_model": _effective_reflection_model(config) if config.optimizer == "gepa" else None,
@@ -660,6 +662,7 @@ def _split_result_summary(
         "scored": summary["scored"],
         "passed": summary["passed"],
         "unscored": summary["unscored"],
+        "unscored_reasons": summarize_unscored_reasons(scores),
     }
 
 
@@ -960,6 +963,16 @@ def _sum_optional_counts(*values: Optional[int]) -> Optional[int]:
     if not known:
         return None
     return sum(known)
+
+
+def _summary_benchmark(
+    eval_examples: Sequence[BenchmarkExample],
+    selection_summary: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    dataset = (selection_summary or {}).get("dataset") or {}
+    if dataset.get("benchmark"):
+        return str(dataset["benchmark"])
+    return eval_examples[0].benchmark_id if eval_examples else None
 
 
 def _effective_num_threads(config: DSPyMIPROConfig) -> Optional[int]:
