@@ -112,10 +112,10 @@ class RejectedCandidateValidationTargetClient(FakeTargetClient):
             output = "not valid json"
         elif phase == "validation_gate_base":
             output = "5"
-        elif phase == "validation_gate_candidate" and "PACT-EL Behavioral Contract" in prompt:
+        elif phase == "validation_gate_candidate" and "## Constraints" in prompt:
             output = "4"
         elif "2+2" in str(input):
-            output = "4" if "PACT-EL Behavioral Contract" in prompt else "5"
+            output = "4" if "## Constraints" in prompt else "5"
         else:
             output = "A"
         return ClientResponse(
@@ -276,6 +276,17 @@ def test_default_base_prompt_is_benchmark_specific():
     prompt = default_base_prompt(_spec())
     assert "benchmark-solving" in prompt
     assert "final answer" in prompt
+    for heading in (
+        "## Goal",
+        "## Context",
+        "## Role",
+        "## Input",
+        "## Task",
+        "## Constraints",
+        "## Output Format",
+        "## Quality Bar",
+    ):
+        assert heading in prompt
 
 
 def test_gavel_temperature_validation():

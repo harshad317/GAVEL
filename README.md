@@ -247,6 +247,10 @@ ablations. The runner then evaluates the selected prompt on train, validation,
 and test. It writes prediction JSONL, score JSONL, the full GAVEL optimization
 report, the selected prompt, and a summary JSON.
 
+Base prompts and graph-rendered GAVEL prompts use the same compact structured
+prompt frame: `Goal`, `Context`, `Role`, `Input`, `Task`, `Constraints`,
+`Output Format`, and `Quality Bar`.
+
 ## Architecture
 
 - `pact_el.schemas`: strict Pydantic models for ledgers, graph nodes, patches, canaries, calls, and reports.
@@ -270,6 +274,7 @@ report, the selected prompt, and a summary JSON.
 ## Design Invariants
 
 - The rendered prompt is derived from the Prompt Axiom Graph and GuaranteeScript, not copied from a freeform optimizer rewrite.
+- Runtime prompts use a compact eight-section structure: Goal, Context, Role, Input, Task, Constraints, Output Format, and Quality Bar.
 - Optimizer output must satisfy a strict JSON schema on the first parse. Markdown-fenced or repaired JSON is rejected.
 - Deterministic validators are preferred. LLM judges are represented as counted fallback validators and must be explicitly configured.
 - PACT-EL does not claim to fix missing knowledge, broken tools, bad retrieval, invalid upstream data, or impossible constraints.

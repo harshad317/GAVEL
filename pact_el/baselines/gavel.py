@@ -424,30 +424,82 @@ def _set_progress_postfix(
 
 def default_base_prompt(spec: Optional[BenchmarkSpec] = None) -> str:
     task_type = spec.task_type if spec else None
-    lines = [
-        "You are a precise benchmark-solving assistant.",
+    goal = [
+        "Solve each benchmark example correctly while satisfying every explicit instruction in the user prompt.",
+    ]
+    context = [
+        "The user prompt is the authoritative task input. It may contain content requirements, formatting requirements, hidden evaluator constraints, or distractor wording.",
+    ]
+    if spec is not None:
+        context.append(
+            f"Benchmark: {spec.display_name} ({spec.benchmark_id}). Task type: {spec.task_type.value}. {spec.description}"
+        )
+    role = [
+        "Act as a precise benchmark-solving assistant with strong constraint-following discipline.",
+    ]
+    input_section = [
+        "Use the user's message as the raw input to solve. Do not assume missing data unless the prompt allows it.",
+    ]
+    task = [
+        "Privately identify all explicit constraints before drafting.",
+        "Draft the simplest answer that can satisfy the task.",
+        "Privately verify the answer against every constraint before finalizing.",
+    ]
+    constraints = [
         "Follow the user's instruction exactly.",
-        "Before answering, identify all explicit constraints in the prompt, especially output format, length, ordering, and prohibited content.",
         "Satisfy the requested output shape before adding any optional explanation.",
         "Do not add extra commentary unless the user explicitly asks for it.",
+        "Treat output format, length, ordering, required content, and prohibited content as hard constraints.",
+    ]
+    output_format = [
+        "Return only the final answer requested by the user.",
+        "Do not show private reasoning, checklists, or verification steps.",
+    ]
+    quality_bar = [
+        "The answer is complete only if it solves the task, satisfies every explicit constraint, and avoids unsupported extra content.",
     ]
     if task_type == BenchmarkTaskType.MATH:
-        lines.append("Solve the problem carefully and put the final answer on its own final line as `Answer: <answer>`.")
+        task.append("Solve the problem carefully and compute the final value before answering.")
+        output_format.append("Put the final result on its own final line as `Answer: <answer>`.")
     elif task_type == BenchmarkTaskType.INSTRUCTION_FOLLOWING:
-        lines.append("Satisfy every explicit output constraint in the instruction, including counts, casing, delimiters, required words, forbidden words, and ordering.")
-        lines.append("Privately convert the instruction into a checklist before drafting; treat word, sentence, line, ratio, repetition, and position constraints as hard requirements.")
-        lines.append("For count or ratio constraints, choose a simple structure that makes counting easy, then revise until the requested counts and proportions are exact.")
-        lines.append("For word-property constraints such as vowels, consonants, syllables, first/last letters, alphabetical order, or repeated spans, use only words you can verify against that property.")
-        lines.append("For formatting constraints such as quotes, indentation, options, title case, whitespace, newlines, bullets, or emoji, make the final answer match the requested surface form exactly.")
+        constraints.append("Satisfy every explicit output constraint, including counts, casing, delimiters, required words, forbidden words, and ordering.")
+        task.append("Privately convert the instruction into a checklist; treat word, sentence, line, ratio, repetition, and position constraints as hard requirements.")
+        task.append("For count or ratio constraints, choose a simple structure that makes counting easy, then revise until the requested counts and proportions are exact.")
+        task.append("For word-property constraints such as vowels, consonants, syllables, first/last letters, alphabetical order, or repeated spans, use only words you can verify against that property.")
+        output_format.append("For formatting constraints such as quotes, indentation, options, title case, whitespace, newlines, bullets, or emoji, make the final answer match the requested surface form exactly.")
     elif task_type == BenchmarkTaskType.MULTIPLE_CHOICE:
-        lines.append("Return only the single best answer choice letter unless the prompt explicitly requests explanation.")
+        task.append("Select the single best answer choice.")
+        output_format.append("Return only the answer choice letter unless the prompt explicitly requests explanation.")
     elif task_type == BenchmarkTaskType.CODE_GENERATION:
-        lines.append("Return only complete executable Python code with no markdown fences, no prose, and no copied tests unless the prompt asks for tests.")
+        task.append("Write complete executable Python code that satisfies the specification.")
+        output_format.append("Return code only, with no markdown fences, no prose, and no copied tests unless the prompt asks for tests.")
     elif task_type == BenchmarkTaskType.QUESTION_ANSWERING:
-        lines.append("Answer using only the provided context when context is present, and preserve names, numbers, dates, and units exactly.")
+        constraints.append("Use only the provided context when context is present.")
+        quality_bar.append("Names, numbers, dates, and units are preserved exactly.")
     elif task_type == BenchmarkTaskType.TRUTHFULNESS:
-        lines.append("If a premise is false or unsupported, answer truthfully and avoid imitation of common falsehoods.")
-    return "\n".join(lines)
+        constraints.append("If a premise is false or unsupported, answer truthfully and avoid imitation of common falsehoods.")
+
+    sections = [
+        ("Goal", goal),
+        ("Context", context),
+        ("Role", role),
+        ("Input", input_section),
+        ("Task", task),
+        ("Constraints", constraints),
+        ("Output Format", output_format),
+        ("Quality Bar", quality_bar),
+    ]
+    return _render_structured_sections(sections)
+
+
+def _render_structured_sections(sections: Sequence[tuple[str, Sequence[str]]]) -> str:
+    lines: List[str] = []
+    for title, items in sections:
+        lines.append(f"## {title}")
+        for item in items:
+            lines.append(f"- {item}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 class DiskJsonCache:

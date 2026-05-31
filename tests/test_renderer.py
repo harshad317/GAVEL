@@ -10,9 +10,18 @@ def test_renderer_uses_graph_and_guarantee_script(sample_compiler_output):
         patch=sample_compiler_output.patch,
     )
 
-    assert "# PACT-EL Behavioral Contract" in rendered
+    for heading in (
+        "## Goal",
+        "## Context",
+        "## Role",
+        "## Input",
+        "## Task",
+        "## Constraints",
+        "## Output Format",
+        "## Quality Bar",
+    ):
+        assert heading in rendered
     assert "id=task" in rendered
     assert "PACT_EL_GUARANTEE_SCRIPT" in rendered
-    assert "Soft Guidance From Source Prompt" in rendered
-    assert "Required Self-Check Before Final Answer" in rendered
-
+    assert "Soft guidance from the source prompt" in rendered
+    assert "Revise until every applicable guarantee clause evaluates true." in rendered
