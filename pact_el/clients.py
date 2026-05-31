@@ -139,14 +139,7 @@ class LiteLLMOptimizerClient:
         if response_schema is not None:
             kwargs.setdefault(
                 "response_format",
-                {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "pact_el_compiler_output",
-                        "schema": response_schema,
-                        "strict": True,
-                    },
-                },
+                _response_format_for_schema(response_schema),
             )
 
         started_at = datetime.now(timezone.utc)
@@ -173,6 +166,29 @@ class LiteLLMOptimizerClient:
             metadata={**dict(metadata or {}), "latency_ms": elapsed_ms},
         )
         return ClientResponse(output=message, call_record=record, raw=response)
+
+
+def _response_format_for_schema(response_schema: Mapping[str, Any]) -> Dict[str, Any]:
+    if _has_open_object_schema(response_schema):
+        return {"type": "json_object"}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "pact_el_compiler_output",
+            "schema": response_schema,
+            "strict": True,
+        },
+    }
+
+
+def _has_open_object_schema(schema: Any) -> bool:
+    if isinstance(schema, Mapping):
+        if schema.get("type") == "object" and schema.get("additionalProperties") is not False:
+            return True
+        return any(_has_open_object_schema(value) for value in schema.values())
+    if isinstance(schema, list):
+        return any(_has_open_object_schema(value) for value in schema)
+    return False
 
 
 class LiteLLMTargetClient:
@@ -237,4 +253,3 @@ class LiteLLMTargetClient:
             metadata={**dict(metadata or {}), "latency_ms": elapsed_ms},
         )
         return ClientResponse(output=message, call_record=record, raw=response)
-
