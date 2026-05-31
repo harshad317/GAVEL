@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Mapping, Optional, Sequence
 
+from pydantic import ValidationError
+
 from pact_el.canaries import run_canaries, select_retest_canaries
 from pact_el.clients import OptimizerClient, TargetClient
 from pact_el.compiler import CompilerOutput, ContractCompiler
@@ -25,6 +27,7 @@ from pact_el.schemas import (
     CanaryResult,
     EvidenceRow,
     GateDecision,
+    NoPatchDiagnosis,
     OptimizationReport,
 )
 from pact_el.validators import ValidatorRegistry
@@ -183,14 +186,23 @@ async def _attempt_one_repair(
     canary_concurrency: int,
 ) -> OptimizationReport:
     failed_results = [result for result in canary_results if not result.passed]
-    repair = await compiler.repair(
-        prompt,
-        task_spec,
-        rubric,
-        prior=compiled,
-        failed_results=failed_results,
-        call_ledger=call_ledger,
-    )
+    try:
+        repair = await compiler.repair(
+            prompt,
+            task_spec,
+            rubric,
+            prior=compiled,
+            failed_results=failed_results,
+            call_ledger=call_ledger,
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        return _repair_schema_failure_report(
+            prompt=prompt,
+            compiled=compiled,
+            canary_results=canary_results,
+            call_ledger=call_ledger,
+            exc=exc,
+        )
     repair_prompt = render_prompt(
         repair.graph,
         source_prompt=prompt,
@@ -258,4 +270,51 @@ async def _attempt_one_repair(
         no_patch_diagnosis=diagnosis,
         notes=repair_outcome.reasons,
         metadata={"gate_outcome": repair_outcome.model_dump(mode="json")},
+    )
+
+
+def _repair_schema_failure_report(
+    *,
+    prompt: str,
+    compiled: CompilerOutput,
+    canary_results: Sequence[CanaryResult],
+    call_ledger: CallLedger,
+    exc: Exception,
+) -> OptimizationReport:
+    failed_ids = [result.canary_id for result in canary_results if not result.passed]
+    reason = (
+        "targeted repair output did not match the RepairOutput schema; "
+        "falling back without applying the repair"
+    )
+    diagnosis = NoPatchDiagnosis(
+        reason=reason,
+        evidence_ids=failed_ids,
+        recommended_owner="prompt",
+        confidence=0.55,
+        metadata={
+            "repair_error_type": type(exc).__name__,
+            "repair_error": str(exc),
+        },
+    )
+    return OptimizationReport(
+        original_prompt=prompt,
+        rendered_prompt=prompt,
+        accepted=False,
+        decision=GateDecision.REJECTED_NO_PATCH,
+        graph=compiled.graph,
+        defect_posterior=compiled.defect_posterior,
+        patch=compiled.patch,
+        canaries=compiled.canaries,
+        canary_results=list(canary_results),
+        call_ledger=call_ledger,
+        deterministic_validator_passed=False,
+        no_patch_diagnosis=diagnosis,
+        notes=[reason, str(exc)],
+        metadata={
+            "repair_schema_error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "failed_canary_ids": failed_ids,
+            }
+        },
     )
