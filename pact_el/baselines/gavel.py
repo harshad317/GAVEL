@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import statistics
 import threading
 from collections import Counter
@@ -63,6 +64,10 @@ class GavelConfig:
     validate_rejected_candidates: bool = True
     prompt_portfolio: bool = True
     validation_margin: float = 0.0
+    validation_confidence_z: float = 0.8
+    rejected_candidate_margin: float = 0.08
+    prompt_complexity_margin: float = 0.02
+    self_refine_rounds: int = 1
     allow_code_execution: bool = False
     show_progress: bool = True
     base_prompt: Optional[str] = None
@@ -76,6 +81,14 @@ class GavelConfig:
             raise ValueError("budget must be at least 1")
         if self.validation_margin < 0 or self.validation_margin > 1:
             raise ValueError("validation_margin must be between 0 and 1")
+        if self.validation_confidence_z < 0:
+            raise ValueError("validation_confidence_z must be non-negative")
+        if self.rejected_candidate_margin < 0 or self.rejected_candidate_margin > 1:
+            raise ValueError("rejected_candidate_margin must be between 0 and 1")
+        if self.prompt_complexity_margin < 0 or self.prompt_complexity_margin > 1:
+            raise ValueError("prompt_complexity_margin must be between 0 and 1")
+        if self.self_refine_rounds < 0:
+            raise ValueError("self_refine_rounds must be non-negative")
 
 
 @dataclass
@@ -95,6 +108,7 @@ class EvaluationStats:
 
     requested_workers: int
     max_in_flight: int = 0
+    api_calls: int = 0
 
 
 @dataclass
@@ -112,6 +126,7 @@ class PromptSelection:
     margin: float = 0.0
     enabled: bool = True
     candidate_source: str = "accepted"
+    effective_margin: float = 0.0
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -125,6 +140,7 @@ class PromptSelection:
             "base": self.base_summary,
             "candidate": self.candidate_summary,
             "candidates": self.candidate_summaries,
+            "effective_margin": self.effective_margin,
         }
 
 
@@ -181,6 +197,7 @@ async def run_gavel_baseline(
         workers=config.workers,
         description="GAVEL evidence",
         phase="evidence",
+        self_refine_rounds=config.self_refine_rounds,
     )
     logs = _evidence_logs(train_examples, evidence_predictions, evidence_scores)
 
@@ -213,6 +230,10 @@ async def run_gavel_baseline(
         workers=config.workers,
         enabled=config.validation_gate,
         margin=config.validation_margin,
+        confidence_z=config.validation_confidence_z,
+        rejected_candidate_margin=config.rejected_candidate_margin,
+        prompt_complexity_margin=config.prompt_complexity_margin,
+        self_refine_rounds=config.self_refine_rounds,
     )
     report.metadata = {
         **report.metadata,
@@ -231,6 +252,7 @@ async def run_gavel_baseline(
         allow_code_execution=config.allow_code_execution,
         show_progress=config.show_progress,
         workers=config.workers,
+        self_refine_rounds=config.self_refine_rounds,
     )
     test_eval = split_evaluations["test"]
     scores = test_eval["scores"]
@@ -246,7 +268,7 @@ async def run_gavel_baseline(
         for split_name, split_eval in split_evaluations.items()
     }
     optimization_api_calls = (
-        len(train_examples)
+        evidence_stats.api_calls
         + report.call_ledger.total_calls
         + prompt_selection.api_calls
     )
@@ -284,6 +306,10 @@ async def run_gavel_baseline(
         "cache": config.cache,
         "budget": config.budget,
         "prompt_portfolio": config.prompt_portfolio,
+        "self_refine_rounds": config.self_refine_rounds,
+        "validation_confidence_z": config.validation_confidence_z,
+        "rejected_candidate_margin": config.rejected_candidate_margin,
+        "prompt_complexity_margin": config.prompt_complexity_margin,
         "accepted": prompt_selection.selected_variant != "base",
         "decision": prompt_selection.decision,
         "selected_prompt": prompt_selection.selected_variant,
@@ -326,9 +352,12 @@ async def evaluate_prompt(
     workers: int,
     description: str,
     phase: str,
+    self_refine_rounds: int = 0,
 ) -> tuple[List[Dict[str, Any]], List[ScoreResult], EvaluationStats]:
     if workers < 1:
         raise ValueError("workers must be at least 1")
+    if self_refine_rounds < 0:
+        raise ValueError("self_refine_rounds must be non-negative")
     predictions: List[Optional[Dict[str, Any]]] = [None] * len(examples)
     scores: List[Optional[ScoreResult]] = [None] * len(examples)
     progress = tqdm(
@@ -359,19 +388,22 @@ async def evaluate_prompt(
                     max_in_flight=stats.max_in_flight,
                 )
             try:
-                response = await target_client.complete(
-                    prompt,
-                    example.prompt,
+                output, raw_output, call_count = await _complete_with_self_refinement(
+                    prompt=prompt,
+                    user_input=example.prompt,
+                    target_client=target_client,
                     metadata={
                         "phase": phase,
                         "example_id": example.example_id,
                         "benchmark_id": example.benchmark_id,
                     },
+                    self_refine_rounds=self_refine_rounds,
                 )
+                stats.api_calls += call_count
             finally:
                 async with active_lock:
                     active -= 1
-            prediction = "" if response.output is None else str(response.output)
+            prediction = "" if output is None else str(output)
             score = score_prediction(
                 example,
                 prediction,
@@ -383,7 +415,7 @@ async def evaluate_prompt(
                     "example_id": example.example_id,
                     "benchmark_id": example.benchmark_id,
                     "prediction": prediction,
-                    "raw_prediction": response.output,
+                    "raw_prediction": raw_output,
                 },
                 score,
             )
@@ -417,6 +449,114 @@ async def evaluate_prompt(
         [prediction for prediction in predictions if prediction is not None],
         [score for score in scores if score is not None],
         stats,
+    )
+
+
+async def _complete_with_self_refinement(
+    *,
+    prompt: str,
+    user_input: Any,
+    target_client: TargetClient,
+    metadata: Mapping[str, Any],
+    self_refine_rounds: int,
+) -> tuple[Any, Any, int]:
+    response = await target_client.complete(prompt, user_input, metadata=metadata)
+    output = response.output
+    raw_output = response.output
+    call_count = 1
+    if self_refine_rounds <= 0:
+        return output, raw_output, call_count
+
+    refine_prompt = _self_refinement_prompt(prompt)
+    for round_index in range(self_refine_rounds):
+        refine_metadata = {
+            **dict(metadata),
+            "phase": f"{metadata.get('phase', 'target')}_self_refine_{round_index + 1}",
+            "self_refine_round": round_index + 1,
+        }
+        response = await target_client.complete(
+            refine_prompt,
+            _self_refinement_input(user_input, output),
+            metadata=refine_metadata,
+        )
+        output = response.output
+        raw_output = response.output
+        call_count += 1
+    return output, raw_output, call_count
+
+
+def _self_refinement_prompt(runtime_prompt: str) -> str:
+    clipped_prompt = _truncate_text(runtime_prompt.strip(), max_chars=9000)
+    sections = [
+        (
+            "Goal",
+            [
+                "Repair a draft answer so it satisfies the original user task and the runtime instructions.",
+            ],
+        ),
+        (
+            "Context",
+            [
+                "This is a label-free verification pass. You do not have benchmark labels or scorer feedback.",
+                "The runtime instructions that governed the draft are included below. Apply them as authoritative guidance.",
+                clipped_prompt,
+            ],
+        ),
+        (
+            "Role",
+            [
+                "Act as a strict final-answer verifier and editor.",
+            ],
+        ),
+        (
+            "Input",
+            [
+                "You will receive the original user prompt and the draft answer.",
+            ],
+        ),
+        (
+            "Task",
+            [
+                "Privately extract every explicit requirement from the original user prompt.",
+                "Check the draft against task intent, output format, counts, ordering, required content, prohibited content, and surface-form constraints.",
+                "If the draft is already correct, return it unchanged.",
+                "If the draft violates any requirement, minimally rewrite it until the final answer satisfies the requirements.",
+            ],
+        ),
+        (
+            "Constraints",
+            [
+                "Do not use or invent benchmark labels, expected answers, hidden evaluator data, or external feedback.",
+                "Preserve correct parts of the draft when possible.",
+                "For math, exact-match, multiple-choice, code, QA, and instruction-following tasks, optimize the final answer for strict automated scoring.",
+            ],
+        ),
+        (
+            "Output Format",
+            [
+                "Return only the corrected final answer.",
+                "Do not include analysis, checklists, labels such as 'Corrected answer:', markdown fences, or explanations unless the original user prompt explicitly requires them.",
+            ],
+        ),
+        (
+            "Quality Bar",
+            [
+                "The final answer is acceptable only if a strict evaluator could score it without reading any hidden reasoning.",
+            ],
+        ),
+    ]
+    return _render_structured_sections(sections)
+
+
+def _self_refinement_input(user_input: Any, draft_output: Any) -> str:
+    input_text = user_input if isinstance(user_input, str) else json.dumps(user_input, sort_keys=True)
+    draft_text = "" if draft_output is None else str(draft_output)
+    return (
+        "Original user prompt:\n"
+        f"{input_text}\n\n"
+        "Draft answer:\n"
+        f"{draft_text}\n\n"
+        "Return only the corrected final answer."
     )
 
 
@@ -527,6 +667,87 @@ def task_strategy_prompt(spec: Optional[BenchmarkSpec] = None) -> str:
     metric_items = _metric_strategy_items(spec.metrics if spec else [])
     if metric_items:
         _extend_section(sections, "Task", metric_items)
+    return _render_structured_sections(sections)
+
+
+def constraint_solver_prompt(spec: Optional[BenchmarkSpec] = None) -> str:
+    sections = _default_prompt_sections(spec)
+    _extend_section(
+        sections,
+        "Role",
+        [
+            "Act as a constraint solver first and a writer second.",
+        ],
+    )
+    _extend_section(
+        sections,
+        "Task",
+        [
+            "Privately compile the prompt into measurable constraints before writing any final text.",
+            "Choose an output skeleton with the required number of sentences, lines, bullets, choices, code blocks, tokens, or answer fields before filling content.",
+            "Resolve the most evaluator-visible constraints first: exact answer shape, required labels, counts, positions, allowed characters, forbidden content, and formatting.",
+            "Use low-variance wording. Prefer simple reusable structures over creative prose when creativity increases counting or formatting risk.",
+            "After drafting, run a final private pass over each measurable constraint and minimally edit any failing part.",
+        ],
+    )
+    _extend_section(
+        sections,
+        "Constraints",
+        [
+            "When two requirements compete, preserve the explicit output format and mechanically checkable requirements before style.",
+            "Do not carry constraints from prior examples into the current user prompt.",
+            "Do not introduce decorative wrappers, markup, brackets, bullets, explanations, or extra sections unless the current user prompt asks for them.",
+        ],
+    )
+    task_type = spec.task_type if spec else None
+    if task_type == BenchmarkTaskType.INSTRUCTION_FOLLOWING:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "For exact word counts or ranges, draft with short common words and count the final visible words only.",
+                "For unique-word constraints, avoid reusing any content word and check case-insensitively.",
+                "For keyword-position constraints, place the required word first, last, or at the requested index before drafting surrounding text.",
+                "For vowel, consonant, syllable, palindrome, alphabet, first-letter, last-letter, or word-length constraints, select candidate words deliberately and discard any uncertain word.",
+                "For repeated-span constraints, create the exact span once, copy it the requested number of times, then apply only the allowed changes.",
+                "For no-whitespace, indentation, quote, title-case, option, punctuation, or bracket constraints, verify the final visible characters exactly.",
+            ],
+        )
+    elif task_type == BenchmarkTaskType.MATH:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "Track units and operations explicitly, then put only the normalized final value in the requested answer shape.",
+            ],
+        )
+    elif task_type == BenchmarkTaskType.CODE_GENERATION:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "Treat the prompt and public tests as an executable specification; cover edge cases before returning code.",
+            ],
+        )
+    elif task_type == BenchmarkTaskType.MULTIPLE_CHOICE:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "Compare every option against the question, then output one label with no alternate labels.",
+            ],
+        )
+    elif task_type == BenchmarkTaskType.QUESTION_ANSWERING:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "Constrain the answer to the shortest supported span or value that satisfies the question.",
+            ],
+        )
+    metric_items = _metric_strategy_items(spec.metrics if spec else [])
+    if metric_items:
+        _extend_section(sections, "Quality Bar", metric_items)
     return _render_structured_sections(sections)
 
 
@@ -874,6 +1095,10 @@ async def _select_prompt_with_validation(
     workers: int,
     enabled: bool,
     margin: float,
+    confidence_z: float,
+    rejected_candidate_margin: float,
+    prompt_complexity_margin: float,
+    self_refine_rounds: int,
 ) -> PromptSelection:
     unique_candidates = _dedupe_candidates(candidates, base_prompt=base_prompt)
     if not enabled:
@@ -887,6 +1112,7 @@ async def _select_prompt_with_validation(
             margin=margin,
             enabled=False,
             candidate_source=candidate.source if candidate is not None else "base",
+            effective_margin=margin,
         )
     if not unique_candidates:
         return PromptSelection(
@@ -896,6 +1122,7 @@ async def _select_prompt_with_validation(
             reason="no validation candidates are available",
             margin=margin,
             candidate_source="base",
+            effective_margin=margin,
         )
     if not val_examples:
         candidate = _preferred_candidate(unique_candidates)
@@ -906,6 +1133,7 @@ async def _select_prompt_with_validation(
             reason="no validation examples available",
             margin=margin,
             candidate_source=candidate.source,
+            effective_margin=margin,
         )
 
     base_predictions, base_scores, base_stats = await evaluate_prompt(
@@ -917,17 +1145,19 @@ async def _select_prompt_with_validation(
         workers=workers,
         description="GAVEL validation gate/base",
         phase="validation_gate_base",
+        self_refine_rounds=self_refine_rounds,
     )
     del base_predictions
 
     base_summary = _split_result_summary(
         base_scores,
         examples=len(val_examples),
-        api_calls=len(val_examples),
+        api_calls=base_stats.api_calls,
         stats=base_stats,
     )
     candidate_summaries: Dict[str, Dict[str, Any]] = {}
-    evaluated_candidates: List[tuple[PromptCandidate, Dict[str, Any]]] = []
+    evaluated_candidates: List[tuple[PromptCandidate, Dict[str, Any], List[ScoreResult]]] = []
+    api_calls = base_stats.api_calls
     for candidate in unique_candidates:
         candidate_predictions, candidate_scores, candidate_stats = await evaluate_prompt(
             prompt=candidate.prompt,
@@ -938,22 +1168,36 @@ async def _select_prompt_with_validation(
             workers=workers,
             description=f"GAVEL validation gate/{candidate.name}",
             phase=f"validation_gate_{candidate.name}",
+            self_refine_rounds=self_refine_rounds,
         )
         del candidate_predictions
         candidate_summary = _split_result_summary(
             candidate_scores,
             examples=len(val_examples),
-            api_calls=len(val_examples),
+            api_calls=candidate_stats.api_calls,
             stats=candidate_stats,
         )
+        paired = _paired_score_stats(base_scores, candidate_scores)
+        required_margin = _effective_validation_margin(
+            base_prompt=base_prompt,
+            candidate=candidate,
+            base_summary=base_summary,
+            candidate_summary=candidate_summary,
+            user_margin=margin,
+            confidence_z=confidence_z,
+            rejected_candidate_margin=rejected_candidate_margin,
+            prompt_complexity_margin=prompt_complexity_margin,
+        )
+        candidate_summary["paired"] = paired
+        candidate_summary["required_margin"] = required_margin
         candidate_summaries[candidate.name] = candidate_summary
-        evaluated_candidates.append((candidate, candidate_summary))
+        evaluated_candidates.append((candidate, candidate_summary, candidate_scores))
+        api_calls += candidate_stats.api_calls
 
-    api_calls = len(val_examples) * (1 + len(unique_candidates))
     base_metric = _selection_metric(base_summary)
     scored_candidates = [
-        (candidate, summary, metric)
-        for candidate, summary in evaluated_candidates
+        (candidate, summary, metric, float(summary.get("required_margin") or margin))
+        for candidate, summary, _scores in evaluated_candidates
         for metric in [_selection_metric(summary)]
         if metric is not None
     ]
@@ -971,17 +1215,21 @@ async def _select_prompt_with_validation(
             candidate_summaries=candidate_summaries,
             margin=margin,
             candidate_source=fallback.source if fallback is not None else "base",
+            effective_margin=margin,
         )
 
-    best_candidate, best_summary, best_metric = max(
+    best_candidate, best_summary, best_metric, best_required_margin = max(
         scored_candidates,
         key=lambda item: (
+            item[2] - base_metric - item[3],
             item[2],
             1 if item[0].report_accepted else 0,
             _candidate_priority(item[0]),
         ),
     )
-    if best_metric + 1e-12 >= base_metric + margin:
+    paired = best_summary.get("paired") or {}
+    paired_ok = int(paired.get("wins") or 0) >= int(paired.get("losses") or 0)
+    if best_metric + 1e-12 >= base_metric + best_required_margin and paired_ok:
         decision = (
             best_candidate.report_decision
             if best_candidate.report_accepted
@@ -993,7 +1241,7 @@ async def _select_prompt_with_validation(
             decision=decision,
             reason=(
                 f"{best_candidate.name} validation metric {best_metric:.4f} met "
-                f"base {base_metric:.4f} with margin {margin:.4f}"
+                f"base {base_metric:.4f} with required margin {best_required_margin:.4f}"
             ),
             api_calls=api_calls,
             base_summary=base_summary,
@@ -1001,6 +1249,7 @@ async def _select_prompt_with_validation(
             candidate_summaries=candidate_summaries,
             margin=margin,
             candidate_source=best_candidate.source,
+            effective_margin=best_required_margin,
         )
     return PromptSelection(
         prompt=base_prompt,
@@ -1008,7 +1257,7 @@ async def _select_prompt_with_validation(
         decision="validation_rollback",
         reason=(
             f"best candidate validation metric {best_metric:.4f} fell below "
-            f"base {base_metric:.4f} with margin {margin:.4f}"
+            f"base {base_metric:.4f} with required margin {best_required_margin:.4f}"
         ),
         api_calls=api_calls,
         base_summary=base_summary,
@@ -1016,6 +1265,7 @@ async def _select_prompt_with_validation(
         candidate_summaries=candidate_summaries,
         margin=margin,
         candidate_source=best_candidate.source,
+        effective_margin=best_required_margin,
     )
 
 
@@ -1052,6 +1302,12 @@ def _build_prompt_candidates(
             prompt=task_strategy_prompt(benchmark_spec),
             source="deterministic_task_strategy",
             report_decision="validation_selected_task_strategy",
+        ),
+        PromptCandidate(
+            name="constraint_solver",
+            prompt=constraint_solver_prompt(benchmark_spec),
+            source="deterministic_constraint_solver",
+            report_decision="validation_selected_constraint_solver",
         )
     ]
     evidence_prompt = evidence_strategy_prompt(benchmark_spec, logs)
@@ -1121,10 +1377,89 @@ def _preferred_candidate(candidates: Sequence[PromptCandidate]) -> Optional[Prom
 def _candidate_priority(candidate: PromptCandidate) -> int:
     priorities = {
         "optimized": 3,
+        "constraint_solver": 3,
         "evidence_strategy": 2,
         "task_strategy": 1,
     }
     return priorities.get(candidate.name, 0)
+
+
+def _paired_score_stats(
+    base_scores: Sequence[ScoreResult],
+    candidate_scores: Sequence[ScoreResult],
+) -> Dict[str, Any]:
+    wins = 0
+    losses = 0
+    ties = 0
+    comparable = 0
+    for base, candidate in zip(base_scores, candidate_scores):
+        if base.score is None or candidate.score is None:
+            continue
+        comparable += 1
+        base_value = float(base.score)
+        candidate_value = float(candidate.score)
+        if candidate_value > base_value:
+            wins += 1
+        elif candidate_value < base_value:
+            losses += 1
+        else:
+            ties += 1
+    net = wins - losses
+    return {
+        "comparable": comparable,
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "net_wins": net,
+        "net_win_rate": None if comparable == 0 else net / comparable,
+    }
+
+
+def _effective_validation_margin(
+    *,
+    base_prompt: str,
+    candidate: PromptCandidate,
+    base_summary: Mapping[str, Any],
+    candidate_summary: Mapping[str, Any],
+    user_margin: float,
+    confidence_z: float,
+    rejected_candidate_margin: float,
+    prompt_complexity_margin: float,
+) -> float:
+    base_metric = _selection_metric(base_summary)
+    candidate_metric = _selection_metric(candidate_summary)
+    statistical = 0.0
+    scored = min(
+        int(base_summary.get("scored") or 0),
+        int(candidate_summary.get("scored") or 0),
+    )
+    if base_metric is not None and candidate_metric is not None and scored > 0:
+        base_var = max(0.0, min(1.0, base_metric)) * max(0.0, 1.0 - min(1.0, base_metric))
+        candidate_var = max(0.0, min(1.0, candidate_metric)) * max(0.0, 1.0 - min(1.0, candidate_metric))
+        statistical = confidence_z * math.sqrt((base_var + candidate_var) / scored)
+    source_penalty = rejected_candidate_margin if candidate.source == "rejected" else 0.0
+    complexity_penalty = _prompt_complexity_penalty(
+        base_prompt,
+        candidate.prompt,
+        prompt_complexity_margin=prompt_complexity_margin,
+    )
+    return min(1.0, max(user_margin, statistical) + source_penalty + complexity_penalty)
+
+
+def _prompt_complexity_penalty(
+    base_prompt: str,
+    candidate_prompt: str,
+    *,
+    prompt_complexity_margin: float,
+) -> float:
+    if prompt_complexity_margin <= 0:
+        return 0.0
+    base_tokens = estimate_token_count(base_prompt)
+    candidate_tokens = estimate_token_count(candidate_prompt)
+    delta_tokens = max(0, candidate_tokens - base_tokens)
+    if delta_tokens <= 0:
+        return 0.0
+    return min(0.12, prompt_complexity_margin * (delta_tokens / 1000.0))
 
 
 def _selection_metric(summary: Mapping[str, Any]) -> Optional[float]:
@@ -1149,6 +1484,7 @@ async def _evaluate_report_splits(
     allow_code_execution: bool,
     show_progress: bool,
     workers: int,
+    self_refine_rounds: int,
 ) -> Dict[str, Dict[str, Any]]:
     split_examples = {
         "train": list(train_examples),
@@ -1166,6 +1502,7 @@ async def _evaluate_report_splits(
             workers=workers,
             description=f"GAVEL {split_name}",
             phase=f"final_{split_name}",
+            self_refine_rounds=self_refine_rounds,
         )
         predictions_path, scores_path = _write_split_outputs(
             output_dir,
@@ -1182,7 +1519,7 @@ async def _evaluate_report_splits(
             "summary": _split_result_summary(
                 scores,
                 examples=len(examples),
-                api_calls=len(examples),
+                api_calls=stats.api_calls,
                 stats=stats,
             ),
         }

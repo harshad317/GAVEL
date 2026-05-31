@@ -92,6 +92,7 @@ def render_prompt(
 
     task_lines = [
         "Apply the behavioral contract to the user's input.",
+        "Apply graph clauses conditionally: use a clause only when the current user input calls for that behavior or constraint.",
         "Draft an answer that satisfies the task intent and all applicable constraints.",
         "Privately verify the answer against the executable guarantees before finalizing.",
     ]
@@ -113,10 +114,12 @@ def render_prompt(
         "Return only the final answer requested by the user.",
         "Do not expose private reasoning, checklists, graph metadata, or GuaranteeScript.",
         "Follow any output schema, formatting rule, or user-specified surface form exactly.",
+        "Do not add brackets, bullets, JSON, code fences, headings, explanations, or decorative wrappers unless the current user input asks for them.",
     ]
 
     quality_bar_lines = [
         "Draft the answer.",
+        "Do not carry evidence-row or canary-specific constraints into unrelated inputs.",
         "Interpret the GuaranteeScript over the candidate answer using input, output_text, and parsed_output when JSON is present.",
         "Revise until every applicable guarantee clause evaluates true.",
         "If a clause cannot be satisfied because the task lacks data, return the allowed uncertainty or refusal behavior from the contract instead of inventing facts.",

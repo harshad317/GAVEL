@@ -109,6 +109,9 @@ Hard rules:
 - Preserve behavior that is not implicated by the defect posterior.
 - Treat success rows as regression constraints and failure rows as evidence for a general defect.
 - Prefer defects with repeated support, high prompt-fixability, high expected gain, and low regression risk.
+- Never convert a constraint observed in only some evidence rows into an unconditional global runtime requirement. Express it as a conditional policy such as "when the current prompt requests this constraint, verify it this way."
+- Graph node statements must generalize across unseen inputs. Do not make every future answer use a specific bracket pattern, vowel set, word count, schema, answer style, or topic unless the task specification itself always requires it.
+- For heterogeneous benchmark tasks, prefer meta-rules for detecting and satisfying current-input constraints over narrow rules copied from failed examples.
 - Distinguish prompt-fixable failures from model-knowledge, tool, retrieval, evaluator, or impossible-constraint failures.
 - Put hard clauses in GuaranteeScript predicates when deterministic validation is possible.
 - GuaranteeScript predicates must use the supported JSONLogic subset only: var, if, and, or, !/not, !!, ==, !=, <, <=, >, >=, in, missing, missing_some, cat, substr, +, -, *, /, %, max, min, all, some, none. Do not invent keys such as type, all_of, clauses, regex, or description inside predicates.
@@ -171,6 +174,7 @@ Hard rules:
 - Do not perform a broad rewrite.
 - Edit only the falsified axiom, edge, or guarantee.
 - Retest only the failed canary plus one regression canary.
+- Keep repaired graph clauses conditional on the current user prompt. Do not make evidence-specific constraints apply to unrelated future inputs.
 - If the failure is not prompt-fixable, return a no_patch_diagnosis.
 - Do not output markdown fences or explanatory prose.
 

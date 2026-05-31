@@ -151,6 +151,27 @@ class PromptPortfolioTargetClient(FakeTargetClient):
         )
 
 
+class SelfRefineTargetClient(FakeTargetClient):
+    async def complete(
+        self,
+        prompt: str,
+        input: Any,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ClientResponse:
+        del prompt
+        self.calls += 1
+        phase = (metadata or {}).get("phase")
+        if phase == "test_self_refine_1":
+            output = "4"
+        else:
+            output = "5"
+        return ClientResponse(
+            output=output,
+            raw=output,
+            call_record=_record(CallRole.TARGET, "target_complete", metadata),
+        )
+
+
 def _record(
     role: CallRole,
     name: str,
@@ -207,6 +228,7 @@ async def test_gavel_baseline_compiles_and_reports_splits(tmp_path, sample_compi
         cache=False,
         workers=2,
         show_progress=False,
+        self_refine_rounds=0,
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0"), _numeric_example("gsm8k:train:1")],
@@ -222,7 +244,7 @@ async def test_gavel_baseline_compiles_and_reports_splits(tmp_path, sample_compi
     assert result.summary["method"] == "gavel"
     assert result.summary["temperature"] == 0.2
     assert result.summary["optimizer_temperature"] == 0.3
-    assert result.summary["accepted"] is True
+    assert result.summary["accepted"] is False
     assert result.summary["split_results"]["train"]["score"] == 1.0
     assert result.summary["split_results"]["val"]["score"] == 1.0
     assert result.summary["split_results"]["test"]["score"] == 1.0
@@ -242,6 +264,7 @@ async def test_gavel_validation_gate_rolls_back_regressing_prompt(tmp_path, samp
         workers=2,
         show_progress=False,
         validation_gate=True,
+        self_refine_rounds=0,
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],
@@ -278,6 +301,7 @@ async def test_gavel_validation_gate_can_override_synthetic_canary_rejection(
         validation_gate=True,
         validate_rejected_candidates=True,
         prompt_portfolio=False,
+        self_refine_rounds=0,
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],
@@ -313,6 +337,7 @@ async def test_gavel_validation_gate_can_select_task_strategy_from_portfolio(
         show_progress=False,
         validation_gate=True,
         prompt_portfolio=True,
+        self_refine_rounds=0,
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],
@@ -361,6 +386,9 @@ def test_gavel_temperature_validation():
     with pytest.raises(ValueError, match="validation_margin must be between 0 and 1"):
         GavelConfig(validation_margin=1.1).validate()
 
+    with pytest.raises(ValueError, match="self_refine_rounds must be non-negative"):
+        GavelConfig(self_refine_rounds=-1).validate()
+
 
 @pytest.mark.asyncio
 async def test_gavel_evaluation_uses_worker_concurrency():
@@ -379,3 +407,22 @@ async def test_gavel_evaluation_uses_worker_concurrency():
 
     assert stats.requested_workers == 3
     assert stats.max_in_flight == 3
+
+
+@pytest.mark.asyncio
+async def test_gavel_evaluation_can_self_refine_without_scorer_feedback():
+    predictions, scores, stats = await evaluate_prompt(
+        prompt="answer",
+        examples=[_numeric_example("gsm8k:test:0")],
+        target_client=SelfRefineTargetClient(),
+        allow_code_execution=False,
+        show_progress=False,
+        workers=1,
+        description="test",
+        phase="test",
+        self_refine_rounds=1,
+    )
+
+    assert predictions[0]["prediction"] == "4"
+    assert scores[0].score == 1.0
+    assert stats.api_calls == 2

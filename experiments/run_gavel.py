@@ -109,6 +109,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Minimum validation-score improvement required to keep a non-base prompt.",
     )
+    parser.add_argument(
+        "--validation-confidence-z",
+        type=float,
+        default=0.8,
+        help="Validation uplift must also clear this many standard errors to reduce prompt-selection overfit.",
+    )
+    parser.add_argument(
+        "--rejected-candidate-margin",
+        type=float,
+        default=0.08,
+        help="Extra validation margin required before using a canary-rejected compiler candidate.",
+    )
+    parser.add_argument(
+        "--prompt-complexity-margin",
+        type=float,
+        default=0.02,
+        help="Extra validation margin per 1000 added prompt tokens for longer prompt candidates.",
+    )
+    parser.add_argument(
+        "--self-refine-rounds",
+        type=int,
+        default=1,
+        help="Label-free target-model draft repair rounds per evaluated example.",
+    )
     parser.add_argument("--prompt", help="Override the default base prompt.")
     parser.add_argument("--prompt-file", help="Read the base prompt from a file.")
     parser.add_argument(
@@ -164,6 +188,10 @@ async def async_main() -> None:
         validate_rejected_candidates=not args.disable_rejected_candidate_validation,
         prompt_portfolio=not args.disable_prompt_portfolio,
         validation_margin=args.validation_margin,
+        validation_confidence_z=args.validation_confidence_z,
+        rejected_candidate_margin=args.rejected_candidate_margin,
+        prompt_complexity_margin=args.prompt_complexity_margin,
+        self_refine_rounds=args.self_refine_rounds,
         allow_code_execution=args.allow_code_execution,
         show_progress=not args.no_progress,
         base_prompt=base_prompt,
@@ -215,6 +243,10 @@ async def async_main() -> None:
                 "validate_rejected_candidates": not args.disable_rejected_candidate_validation,
                 "prompt_portfolio": not args.disable_prompt_portfolio,
                 "validation_margin": args.validation_margin,
+                "validation_confidence_z": args.validation_confidence_z,
+                "rejected_candidate_margin": args.rejected_candidate_margin,
+                "prompt_complexity_margin": args.prompt_complexity_margin,
+                "self_refine_rounds": args.self_refine_rounds,
                 "train_n": train_n,
                 "val_n": val_n,
                 "test_n": test_n,

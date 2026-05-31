@@ -239,17 +239,19 @@ python3 experiments/run_gavel.py \
 The GAVEL runner first evaluates the base prompt on the selected train examples
 to build an Evidence Ledger, compiles one PACT-EL/GAVEL prompt, then
 validation-scores a prompt portfolio before final evaluation. The default
-portfolio contains a benchmark-general task strategy prompt, an aggregate
-evidence strategy prompt when train failures expose recurring patterns, and the
-compiled GAVEL candidate. The held-out validation gate selects the best
-non-base prompt only when it meets the base validation score plus the configured
-margin, otherwise it rolls back to base. It can also validation-score candidates
-rejected by synthetic canaries, keeping them only when held-out validation beats
-the base prompt; use `--disable-rejected-candidate-validation` for stricter
-canary-only ablations, or `--disable-prompt-portfolio` to score only the
-compiled candidate. The runner then evaluates the selected prompt on train,
-validation, and test. It writes prediction JSONL, score JSONL, the full GAVEL
-optimization report, the selected prompt, and a summary JSON.
+portfolio contains a benchmark-general task strategy prompt, a stricter
+constraint-solver prompt, an aggregate evidence strategy prompt when train
+failures expose recurring patterns, and the compiled GAVEL candidate. The
+held-out validation gate selects the best non-base prompt only when it clears
+the base validation score by a confidence-aware effective margin. Canary-
+rejected and much longer prompts need extra validation lift before they can be
+selected, which reduces narrow prompt overfit. Use
+`--disable-rejected-candidate-validation` for stricter canary-only ablations,
+or `--disable-prompt-portfolio` to score only the compiled candidate. The
+runner then evaluates the selected prompt on train, validation, and test using
+an optional label-free self-refinement pass (`--self-refine-rounds`, default
+`1`). It writes prediction JSONL, score JSONL, the full GAVEL optimization
+report, the selected prompt, and a summary JSON.
 
 Base prompts and graph-rendered GAVEL prompts use the same compact structured
 prompt frame: `Goal`, `Context`, `Role`, `Input`, `Task`, `Constraints`,
@@ -280,6 +282,8 @@ prompt frame: `Goal`, `Context`, `Role`, `Input`, `Task`, `Constraints`,
 - The rendered prompt is derived from the Prompt Axiom Graph and GuaranteeScript, not copied from a freeform optimizer rewrite.
 - Runtime prompts use a compact eight-section structure: Goal, Context, Role, Input, Task, Constraints, Output Format, and Quality Bar.
 - Live GAVEL selection compares a small portfolio of structured prompts against the base prompt on held-out validation before test evaluation.
+- Validation selection uses statistical, canary-rejection, and prompt-complexity margins so small validation wins do not automatically select brittle prompts.
+- Runtime compiled graph clauses are conditional on the current user input; evidence-specific constraints must not become unconditional requirements for unrelated examples.
 - Optimizer output must satisfy a strict JSON schema on the first parse. Markdown-fenced or repaired JSON is rejected.
 - Deterministic validators are preferred. LLM judges are represented as counted fallback validators and must be explicitly configured.
 - PACT-EL does not claim to fix missing knowledge, broken tools, bad retrieval, invalid upstream data, or impossible constraints.
