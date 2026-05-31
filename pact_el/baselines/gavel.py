@@ -7,6 +7,7 @@ import hashlib
 import json
 import statistics
 import threading
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,7 @@ class GavelConfig:
     allow_one_repair: bool = True
     validation_gate: bool = True
     validate_rejected_candidates: bool = True
+    prompt_portfolio: bool = True
     validation_margin: float = 0.0
     allow_code_execution: bool = False
     show_progress: bool = True
@@ -106,6 +108,7 @@ class PromptSelection:
     api_calls: int = 0
     base_summary: Optional[Dict[str, Any]] = None
     candidate_summary: Optional[Dict[str, Any]] = None
+    candidate_summaries: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     margin: float = 0.0
     enabled: bool = True
     candidate_source: str = "accepted"
@@ -121,7 +124,19 @@ class PromptSelection:
             "candidate_source": self.candidate_source,
             "base": self.base_summary,
             "candidate": self.candidate_summary,
+            "candidates": self.candidate_summaries,
         }
+
+
+@dataclass(frozen=True)
+class PromptCandidate:
+    """A prompt variant competing in validation selection."""
+
+    name: str
+    prompt: str
+    source: str
+    report_decision: str
+    report_accepted: bool = False
 
 
 async def run_gavel_baseline(
@@ -180,17 +195,17 @@ async def run_gavel_baseline(
         allow_one_repair=config.allow_one_repair,
         canary_concurrency=config.workers,
     )
-    candidate_prompt, candidate_source = _selection_candidate_prompt(
-        report,
+    prompt_candidates = _build_prompt_candidates(
         base_prompt=base_prompt,
+        report=report,
+        benchmark_spec=benchmark_spec,
+        logs=logs,
+        enabled=config.prompt_portfolio,
         validate_rejected_candidates=config.validate_rejected_candidates,
     )
     prompt_selection = await _select_prompt_with_validation(
         base_prompt=base_prompt,
-        candidate_prompt=candidate_prompt,
-        candidate_source=candidate_source,
-        report_decision=report.decision.value,
-        report_accepted=report.accepted,
+        candidates=prompt_candidates,
         val_examples=val_examples,
         target_client=target_client,
         allow_code_execution=config.allow_code_execution,
@@ -268,7 +283,8 @@ async def run_gavel_baseline(
         "max_in_flight": max_in_flight,
         "cache": config.cache,
         "budget": config.budget,
-        "accepted": prompt_selection.selected_variant == "optimized",
+        "prompt_portfolio": config.prompt_portfolio,
+        "accepted": prompt_selection.selected_variant != "base",
         "decision": prompt_selection.decision,
         "selected_prompt": prompt_selection.selected_variant,
         "validation_gate": prompt_selection.summary(),
@@ -423,6 +439,134 @@ def _set_progress_postfix(
 
 
 def default_base_prompt(spec: Optional[BenchmarkSpec] = None) -> str:
+    return _render_structured_sections(_default_prompt_sections(spec))
+
+
+def task_strategy_prompt(spec: Optional[BenchmarkSpec] = None) -> str:
+    sections = _default_prompt_sections(spec)
+    _extend_section(
+        sections,
+        "Task",
+        [
+            "Use a deterministic solve-and-verify loop: parse requirements, choose the simplest compliant structure, produce the answer, then check every requirement once more.",
+            "When the task has multiple constraints, satisfy the most mechanically verifiable constraints first so the final answer is easy to audit.",
+        ],
+    )
+    _extend_section(
+        sections,
+        "Quality Bar",
+        [
+            "Prefer a shorter, more controlled answer over a fluent answer that is hard to verify.",
+            "Before finalizing, ensure the answer would still be correct if scored by a strict exact-match, format, unit-test, or rule-based evaluator.",
+        ],
+    )
+    task_type = spec.task_type if spec else None
+    if task_type == BenchmarkTaskType.MATH:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "Privately compute through the problem step by step, then independently check the final arithmetic.",
+                "If the answer is a number, normalize signs, fractions, decimals, and units according to the prompt before returning it.",
+            ],
+        )
+    elif task_type == BenchmarkTaskType.INSTRUCTION_FOLLOWING:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "For exact counts, preselect the number of words, sentences, lines, list items, or repetitions before writing.",
+                "For ratios or balances, choose a simple symmetric structure and verify each side of the ratio explicitly.",
+                "For word-property constraints, use conservative vocabulary and avoid words whose spelling, vowels, consonants, syllables, or first/last letters you cannot verify.",
+                "For sentence-local constraints, build each sentence separately and check the required keyword, punctuation, alliteration, length, or ordering before moving on.",
+            ],
+        )
+        _extend_section(
+            sections,
+            "Constraints",
+            [
+                "If satisfying all constraints requires sacrificing style or richness, sacrifice style and keep the constraints exact.",
+            ],
+        )
+    elif task_type == BenchmarkTaskType.MULTIPLE_CHOICE:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "Map each choice label to its answer text before deciding.",
+                "Eliminate distractors using the question, then return the selected label exactly.",
+            ],
+        )
+    elif task_type == BenchmarkTaskType.CODE_GENERATION:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "Infer edge cases from the prompt and public tests.",
+                "Return a complete implementation with required imports and helper functions included.",
+            ],
+        )
+    elif task_type == BenchmarkTaskType.QUESTION_ANSWERING:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "Locate the shortest answer span or normalized answer supported by the provided context.",
+                "Avoid explanatory wrapping when the evaluator expects a concise final answer.",
+            ],
+        )
+    elif task_type == BenchmarkTaskType.TRUTHFULNESS:
+        _extend_section(
+            sections,
+            "Task",
+            [
+                "Check whether the question contains a false presupposition before answering directly.",
+                "When uncertain, give a calibrated truthful answer instead of a popular but unsupported claim.",
+            ],
+        )
+    metric_items = _metric_strategy_items(spec.metrics if spec else [])
+    if metric_items:
+        _extend_section(sections, "Task", metric_items)
+    return _render_structured_sections(sections)
+
+
+def evidence_strategy_prompt(
+    spec: Optional[BenchmarkSpec],
+    logs: Sequence[Mapping[str, Any]],
+) -> Optional[str]:
+    summary = _summarize_evidence_patterns(logs)
+    if not summary:
+        return None
+    sections = _default_prompt_sections(spec)
+    _extend_section(
+        sections,
+        "Context",
+        [
+            "Training evidence revealed recurring prompt-fixable failure modes. Use these as transferable risk signals, not as memorized examples.",
+            *summary,
+        ],
+    )
+    _extend_section(
+        sections,
+        "Task",
+        [
+            "Before drafting, identify whether the current input resembles any recurring failure mode from the evidence summary.",
+            "If it does, apply the corresponding stricter verification pattern before finalizing.",
+        ],
+    )
+    _extend_section(
+        sections,
+        "Quality Bar",
+        [
+            "The answer is incomplete if it repeats a high-frequency training failure mode from the evidence summary.",
+        ],
+    )
+    return _render_structured_sections(sections)
+
+
+def _default_prompt_sections(
+    spec: Optional[BenchmarkSpec] = None,
+) -> List[tuple[str, List[str]]]:
     task_type = spec.task_type if spec else None
     goal = [
         "Solve each benchmark example correctly while satisfying every explicit instruction in the user prompt.",
@@ -489,7 +633,7 @@ def default_base_prompt(spec: Optional[BenchmarkSpec] = None) -> str:
         ("Output Format", output_format),
         ("Quality Bar", quality_bar),
     ]
-    return _render_structured_sections(sections)
+    return sections
 
 
 def _render_structured_sections(sections: Sequence[tuple[str, Sequence[str]]]) -> str:
@@ -500,6 +644,108 @@ def _render_structured_sections(sections: Sequence[tuple[str, Sequence[str]]]) -
             lines.append(f"- {item}")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def _extend_section(
+    sections: List[tuple[str, List[str]]],
+    title: str,
+    items: Sequence[str],
+) -> None:
+    for section_title, section_items in sections:
+        if section_title == title:
+            section_items.extend(items)
+            return
+    sections.append((title, list(items)))
+
+
+def _summarize_evidence_patterns(logs: Sequence[Mapping[str, Any]]) -> List[str]:
+    failure_count = 0
+    area_counts: Counter[str] = Counter()
+    metric_counts: Counter[str] = Counter()
+    family_counts: Counter[str] = Counter()
+    instruction_counts: Counter[str] = Counter()
+    for row in logs:
+        if row.get("passed") is not False:
+            continue
+        failure_count += 1
+        area = row.get("area")
+        if area:
+            area_counts[str(area)] += 1
+        metadata = row.get("metadata") or {}
+        metric = metadata.get("metric")
+        if metric:
+            metric_counts[str(metric)] += 1
+        for instruction_id in metadata.get("failed_instruction_ids") or []:
+            instruction = str(instruction_id)
+            instruction_counts[instruction] += 1
+            family_counts[instruction.split(":", 1)[0]] += 1
+
+    if failure_count == 0:
+        return []
+    summary = [f"Training evidence failures: {failure_count}."]
+    if area_counts:
+        summary.append("Most affected contract areas: " + _format_counter(area_counts, limit=4) + ".")
+    if metric_counts:
+        summary.append("Most affected scorer metrics: " + _format_counter(metric_counts, limit=4) + ".")
+    if family_counts:
+        summary.append("Most affected instruction families: " + _format_counter(family_counts, limit=6) + ".")
+        family_items = _instruction_family_strategy_items(family_counts)
+        if family_items:
+            summary.append("Transferable instruction checks: " + "; ".join(family_items[:6]) + ".")
+    if instruction_counts:
+        summary.append("Most frequent failed instruction ids: " + _format_counter(instruction_counts, limit=8) + ".")
+    if metric_counts:
+        metric_items = _metric_strategy_items(metric_counts.keys())
+        if metric_items:
+            summary.append("Transferable metric checks: " + "; ".join(item.rstrip(".") for item in metric_items[:5]) + ".")
+    return summary
+
+
+def _format_counter(counter: Counter[str], *, limit: int) -> str:
+    return ", ".join(f"{key}={count}" for key, count in counter.most_common(limit))
+
+
+def _metric_strategy_items(metrics: Sequence[Any]) -> List[str]:
+    values = {
+        metric.value if isinstance(metric, MetricKind) else str(metric)
+        for metric in metrics
+    }
+    items: List[str] = []
+    if MetricKind.OFFICIAL_EVALUATOR.value in values:
+        items.append("For official evaluators, optimize for verifier-visible constraints: exact format, explicit inclusions/exclusions, counts, positions, and required transformations.")
+    if MetricKind.NUMERIC_EXACT.value in values:
+        items.append("For numeric exact-match scoring, make the final answer contain the normalized number the scorer should extract, with no competing numbers after it.")
+    if MetricKind.MULTIPLE_CHOICE_ACCURACY.value in values:
+        items.append("For multiple-choice scoring, return one unambiguous choice label and avoid mentioning alternate labels in the final answer.")
+    if MetricKind.EXACT_MATCH.value in values:
+        items.append("For exact-match scoring, produce the shortest normalized answer string that matches the expected entity, value, or phrase.")
+    if MetricKind.TOKEN_F1.value in values:
+        items.append("For token-F1 scoring, include all essential answer tokens while avoiding unsupported surrounding explanation.")
+    if MetricKind.PASS_AT_1.value in values:
+        items.append("For pass-at-1 code scoring, return executable code only, include needed imports, and handle edge cases implied by the tests.")
+    return items
+
+
+def _instruction_family_strategy_items(family_counts: Counter[str]) -> List[str]:
+    strategy_by_family = {
+        "words": "for word-property constraints, use words whose spelling, vowels, consonants, syllables, first letters, and last letters are easy to verify",
+        "count": "for count constraints, decide the exact number of words, lines, list items, or occurrences before writing",
+        "ratio": "for ratio constraints, use a simple repeated structure and verify each side of the ratio explicitly",
+        "sentence": "for sentence constraints, construct and verify one sentence at a time before joining the answer",
+        "format": "for format constraints, match requested delimiters, casing, whitespace, bullets, quotes, and line breaks exactly",
+        "repeat": "for repetition constraints, count each required repeated word, phrase, or span after drafting",
+        "custom": "for custom transformations, perform the requested transformation literally and avoid paraphrasing it away",
+        "keywords": "for keyword constraints, include required keywords exactly and remove forbidden keywords completely",
+        "language": "for language constraints, keep the entire final answer in the requested language",
+        "startend": "for start/end constraints, verify the first and last visible tokens exactly",
+        "punctuation": "for punctuation constraints, count and place the requested punctuation marks deliberately",
+    }
+    items: List[str] = []
+    for family, _count in family_counts.most_common():
+        strategy = strategy_by_family.get(str(family))
+        if strategy is not None:
+            items.append(strategy)
+    return items
 
 
 class DiskJsonCache:
@@ -620,10 +866,7 @@ class CachedOptimizerClient:
 async def _select_prompt_with_validation(
     *,
     base_prompt: str,
-    candidate_prompt: str,
-    candidate_source: str,
-    report_decision: str,
-    report_accepted: bool,
+    candidates: Sequence[PromptCandidate],
     val_examples: Sequence[BenchmarkExample],
     target_client: TargetClient,
     allow_code_execution: bool,
@@ -632,43 +875,37 @@ async def _select_prompt_with_validation(
     enabled: bool,
     margin: float,
 ) -> PromptSelection:
+    unique_candidates = _dedupe_candidates(candidates, base_prompt=base_prompt)
     if not enabled:
-        selected_variant = "optimized" if report_accepted else "base"
+        candidate = _preferred_candidate(unique_candidates)
+        selected_variant = candidate.name if candidate is not None and candidate.report_accepted else "base"
         return PromptSelection(
-            prompt=candidate_prompt if selected_variant == "optimized" else base_prompt,
+            prompt=candidate.prompt if candidate is not None and selected_variant != "base" else base_prompt,
             selected_variant=selected_variant,
-            decision=report_decision,
+            decision=candidate.report_decision if candidate is not None else "base",
             reason="validation gate disabled",
             margin=margin,
             enabled=False,
-            candidate_source=candidate_source,
+            candidate_source=candidate.source if candidate is not None else "base",
         )
-    if not report_accepted and candidate_source == "none":
+    if not unique_candidates:
         return PromptSelection(
             prompt=base_prompt,
             selected_variant="base",
-            decision=report_decision,
-            reason="optimizer patch was rejected and no validation candidate is available",
+            decision="base",
+            reason="no validation candidates are available",
             margin=margin,
-            candidate_source=candidate_source,
+            candidate_source="base",
         )
     if not val_examples:
+        candidate = _preferred_candidate(unique_candidates)
         return PromptSelection(
-            prompt=candidate_prompt,
-            selected_variant="optimized",
-            decision=report_decision,
+            prompt=candidate.prompt,
+            selected_variant=candidate.name,
+            decision=candidate.report_decision,
             reason="no validation examples available",
             margin=margin,
-            candidate_source=candidate_source,
-        )
-    if candidate_prompt.strip() == base_prompt.strip():
-        return PromptSelection(
-            prompt=base_prompt,
-            selected_variant="base",
-            decision=report_decision,
-            reason="candidate prompt matches base prompt",
-            margin=margin,
-            candidate_source=candidate_source,
+            candidate_source=candidate.source,
         )
 
     base_predictions, base_scores, base_stats = await evaluate_prompt(
@@ -682,17 +919,6 @@ async def _select_prompt_with_validation(
         phase="validation_gate_base",
     )
     del base_predictions
-    candidate_predictions, candidate_scores, candidate_stats = await evaluate_prompt(
-        prompt=candidate_prompt,
-        examples=val_examples,
-        target_client=target_client,
-        allow_code_execution=allow_code_execution,
-        show_progress=show_progress,
-        workers=workers,
-        description="GAVEL validation gate/candidate",
-        phase="validation_gate_candidate",
-    )
-    del candidate_predictions
 
     base_summary = _split_result_summary(
         base_scores,
@@ -700,58 +926,160 @@ async def _select_prompt_with_validation(
         api_calls=len(val_examples),
         stats=base_stats,
     )
-    candidate_summary = _split_result_summary(
-        candidate_scores,
-        examples=len(val_examples),
-        api_calls=len(val_examples),
-        stats=candidate_stats,
-    )
-    api_calls = len(val_examples) * 2
+    candidate_summaries: Dict[str, Dict[str, Any]] = {}
+    evaluated_candidates: List[tuple[PromptCandidate, Dict[str, Any]]] = []
+    for candidate in unique_candidates:
+        candidate_predictions, candidate_scores, candidate_stats = await evaluate_prompt(
+            prompt=candidate.prompt,
+            examples=val_examples,
+            target_client=target_client,
+            allow_code_execution=allow_code_execution,
+            show_progress=show_progress,
+            workers=workers,
+            description=f"GAVEL validation gate/{candidate.name}",
+            phase=f"validation_gate_{candidate.name}",
+        )
+        del candidate_predictions
+        candidate_summary = _split_result_summary(
+            candidate_scores,
+            examples=len(val_examples),
+            api_calls=len(val_examples),
+            stats=candidate_stats,
+        )
+        candidate_summaries[candidate.name] = candidate_summary
+        evaluated_candidates.append((candidate, candidate_summary))
+
+    api_calls = len(val_examples) * (1 + len(unique_candidates))
     base_metric = _selection_metric(base_summary)
-    candidate_metric = _selection_metric(candidate_summary)
-    if base_metric is None or candidate_metric is None:
-        selected_variant = "optimized" if report_accepted else "base"
+    scored_candidates = [
+        (candidate, summary, metric)
+        for candidate, summary in evaluated_candidates
+        for metric in [_selection_metric(summary)]
+        if metric is not None
+    ]
+    if base_metric is None or not scored_candidates:
+        fallback = _preferred_candidate(unique_candidates)
+        selected_variant = fallback.name if base_metric is None and fallback.report_accepted else "base"
         return PromptSelection(
-            prompt=candidate_prompt if selected_variant == "optimized" else base_prompt,
+            prompt=fallback.prompt if selected_variant != "base" else base_prompt,
             selected_variant=selected_variant,
-            decision=report_decision if report_accepted else "validation_unscored_rollback",
+            decision=fallback.report_decision if selected_variant != "base" else "validation_unscored_rollback",
             reason="validation scorer produced no comparable metric",
             api_calls=api_calls,
             base_summary=base_summary,
-            candidate_summary=candidate_summary,
+            candidate_summary=candidate_summaries.get(fallback.name) if fallback is not None else None,
+            candidate_summaries=candidate_summaries,
             margin=margin,
-            candidate_source=candidate_source,
+            candidate_source=fallback.source if fallback is not None else "base",
         )
-    if candidate_metric + 1e-12 >= base_metric + margin:
-        decision = report_decision if report_accepted else "validation_override"
+
+    best_candidate, best_summary, best_metric = max(
+        scored_candidates,
+        key=lambda item: (
+            item[2],
+            1 if item[0].report_accepted else 0,
+            _candidate_priority(item[0]),
+        ),
+    )
+    if best_metric + 1e-12 >= base_metric + margin:
+        decision = (
+            best_candidate.report_decision
+            if best_candidate.report_accepted
+            else "validation_override"
+        )
         return PromptSelection(
-            prompt=candidate_prompt,
-            selected_variant="optimized",
+            prompt=best_candidate.prompt,
+            selected_variant=best_candidate.name,
             decision=decision,
             reason=(
-                f"candidate validation metric {candidate_metric:.4f} met "
+                f"{best_candidate.name} validation metric {best_metric:.4f} met "
                 f"base {base_metric:.4f} with margin {margin:.4f}"
             ),
             api_calls=api_calls,
             base_summary=base_summary,
-            candidate_summary=candidate_summary,
+            candidate_summary=best_summary,
+            candidate_summaries=candidate_summaries,
             margin=margin,
-            candidate_source=candidate_source,
+            candidate_source=best_candidate.source,
         )
     return PromptSelection(
         prompt=base_prompt,
         selected_variant="base",
         decision="validation_rollback",
         reason=(
-            f"candidate validation metric {candidate_metric:.4f} fell below "
+            f"best candidate validation metric {best_metric:.4f} fell below "
             f"base {base_metric:.4f} with margin {margin:.4f}"
         ),
         api_calls=api_calls,
         base_summary=base_summary,
-        candidate_summary=candidate_summary,
+        candidate_summary=best_summary,
+        candidate_summaries=candidate_summaries,
         margin=margin,
-        candidate_source=candidate_source,
+        candidate_source=best_candidate.source,
     )
+
+
+def _build_prompt_candidates(
+    *,
+    base_prompt: str,
+    report: Any,
+    benchmark_spec: Optional[BenchmarkSpec],
+    logs: Sequence[Mapping[str, Any]],
+    enabled: bool,
+    validate_rejected_candidates: bool,
+) -> List[PromptCandidate]:
+    if not enabled:
+        candidate_prompt, candidate_source = _selection_candidate_prompt(
+            report,
+            base_prompt=base_prompt,
+            validate_rejected_candidates=validate_rejected_candidates,
+        )
+        if candidate_source == "none":
+            return []
+        return [
+            PromptCandidate(
+                name="optimized",
+                prompt=candidate_prompt,
+                source=candidate_source,
+                report_decision=report.decision.value,
+                report_accepted=report.accepted,
+            )
+        ]
+
+    candidates = [
+        PromptCandidate(
+            name="task_strategy",
+            prompt=task_strategy_prompt(benchmark_spec),
+            source="deterministic_task_strategy",
+            report_decision="validation_selected_task_strategy",
+        )
+    ]
+    evidence_prompt = evidence_strategy_prompt(benchmark_spec, logs)
+    if evidence_prompt is not None:
+        candidates.append(
+            PromptCandidate(
+                name="evidence_strategy",
+                prompt=evidence_prompt,
+                source="deterministic_evidence_strategy",
+                report_decision="validation_selected_evidence_strategy",
+            )
+        )
+    candidate_prompt, candidate_source = _selection_candidate_prompt(
+        report,
+        base_prompt=base_prompt,
+        validate_rejected_candidates=validate_rejected_candidates,
+    )
+    if candidate_source != "none":
+        candidates.append(
+            PromptCandidate(
+                name="optimized",
+                prompt=candidate_prompt,
+                source=candidate_source,
+                report_decision=report.decision.value,
+                report_accepted=report.accepted,
+            )
+        )
+    return _dedupe_candidates(candidates, base_prompt=base_prompt)
 
 
 def _selection_candidate_prompt(
@@ -765,6 +1093,38 @@ def _selection_candidate_prompt(
     if not validate_rejected_candidates or report.graph is None or report.patch is None:
         return base_prompt, "none"
     return render_prompt(report.graph, source_prompt=base_prompt, patch=report.patch), "rejected"
+
+
+def _dedupe_candidates(
+    candidates: Sequence[PromptCandidate],
+    *,
+    base_prompt: str,
+) -> List[PromptCandidate]:
+    seen = {base_prompt.strip()}
+    unique: List[PromptCandidate] = []
+    for candidate in candidates:
+        normalized = candidate.prompt.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(candidate)
+    return unique
+
+
+def _preferred_candidate(candidates: Sequence[PromptCandidate]) -> Optional[PromptCandidate]:
+    accepted = [candidate for candidate in candidates if candidate.report_accepted]
+    if accepted:
+        return max(accepted, key=_candidate_priority)
+    return max(candidates, key=_candidate_priority) if candidates else None
+
+
+def _candidate_priority(candidate: PromptCandidate) -> int:
+    priorities = {
+        "optimized": 3,
+        "evidence_strategy": 2,
+        "task_strategy": 1,
+    }
+    return priorities.get(candidate.name, 0)
 
 
 def _selection_metric(summary: Mapping[str, Any]) -> Optional[float]:

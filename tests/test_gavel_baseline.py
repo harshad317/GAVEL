@@ -88,7 +88,7 @@ class ValidationRegressionTargetClient(FakeTargetClient):
         phase = (metadata or {}).get("phase")
         if (metadata or {}).get("canary_id"):
             output = '{"priority": "urgent"}'
-        elif phase == "validation_gate_candidate":
+        elif str(phase).startswith("validation_gate_") and phase != "validation_gate_base":
             output = "5"
         else:
             output = "4" if "2+2" in str(input) else "A"
@@ -112,10 +112,36 @@ class RejectedCandidateValidationTargetClient(FakeTargetClient):
             output = "not valid json"
         elif phase == "validation_gate_base":
             output = "5"
-        elif phase == "validation_gate_candidate" and "## Constraints" in prompt:
+        elif phase == "validation_gate_optimized" and "## Constraints" in prompt:
             output = "4"
         elif "2+2" in str(input):
             output = "4" if "## Constraints" in prompt else "5"
+        else:
+            output = "A"
+        return ClientResponse(
+            output=output,
+            raw=output,
+            call_record=_record(CallRole.TARGET, "target_complete", metadata),
+        )
+
+
+class PromptPortfolioTargetClient(FakeTargetClient):
+    async def complete(
+        self,
+        prompt: str,
+        input: Any,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ClientResponse:
+        self.calls += 1
+        phase = (metadata or {}).get("phase")
+        if (metadata or {}).get("canary_id"):
+            output = '{"priority": "urgent"}'
+        elif phase == "validation_gate_task_strategy":
+            output = "4"
+        elif phase == "final_test" and "deterministic solve-and-verify loop" in prompt:
+            output = "4"
+        elif "2+2" in str(input):
+            output = "5"
         else:
             output = "A"
         return ClientResponse(
@@ -251,6 +277,7 @@ async def test_gavel_validation_gate_can_override_synthetic_canary_rejection(
         allow_one_repair=False,
         validation_gate=True,
         validate_rejected_candidates=True,
+        prompt_portfolio=False,
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],
@@ -267,6 +294,41 @@ async def test_gavel_validation_gate_can_override_synthetic_canary_rejection(
     assert result.summary["accepted"] is True
     assert result.summary["decision"] == "validation_override"
     assert gate["candidate_source"] == "rejected"
+    assert gate["base"]["score"] == 0.0
+    assert gate["candidate"]["score"] == 1.0
+    assert result.summary["split_results"]["test"]["score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_gavel_validation_gate_can_select_task_strategy_from_portfolio(
+    tmp_path,
+    sample_compiler_output,
+):
+    config = GavelConfig(
+        model="fake-target",
+        optimizer_model="fake-optimizer",
+        output_dir=tmp_path,
+        cache=False,
+        workers=2,
+        show_progress=False,
+        validation_gate=True,
+        prompt_portfolio=True,
+    )
+    result = await run_gavel_baseline(
+        train_examples=[_numeric_example("gsm8k:train:0")],
+        val_examples=[_numeric_example("gsm8k:validation:0")],
+        test_examples=[_numeric_example("gsm8k:test:0")],
+        config=config,
+        benchmark_spec=_spec(),
+        optimizer_client=FakeOptimizerClient(sample_compiler_output.model_dump_json()),
+        target_client=PromptPortfolioTargetClient(),
+    )
+
+    gate = result.summary["validation_gate"]
+    assert result.summary["selected_prompt"] == "task_strategy"
+    assert result.summary["accepted"] is True
+    assert result.summary["decision"] == "validation_override"
+    assert "task_strategy" in gate["candidates"]
     assert gate["base"]["score"] == 0.0
     assert gate["candidate"]["score"] == 1.0
     assert result.summary["split_results"]["test"]["score"] == 1.0

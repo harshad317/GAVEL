@@ -99,10 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not validation-score compiler candidates rejected by synthetic canaries.",
     )
     parser.add_argument(
+        "--disable-prompt-portfolio",
+        action="store_true",
+        help="Only validation-score the compiler candidate instead of deterministic strategy prompts.",
+    )
+    parser.add_argument(
         "--validation-margin",
         type=float,
         default=0.0,
-        help="Minimum validation-score improvement required to keep the optimized prompt.",
+        help="Minimum validation-score improvement required to keep a non-base prompt.",
     )
     parser.add_argument("--prompt", help="Override the default base prompt.")
     parser.add_argument("--prompt-file", help="Read the base prompt from a file.")
@@ -157,6 +162,7 @@ async def async_main() -> None:
         allow_one_repair=not args.disable_repair,
         validation_gate=not args.disable_validation_gate,
         validate_rejected_candidates=not args.disable_rejected_candidate_validation,
+        prompt_portfolio=not args.disable_prompt_portfolio,
         validation_margin=args.validation_margin,
         allow_code_execution=args.allow_code_execution,
         show_progress=not args.no_progress,
@@ -207,6 +213,7 @@ async def async_main() -> None:
                 "budget": args.budget,
                 "validation_gate": not args.disable_validation_gate,
                 "validate_rejected_candidates": not args.disable_rejected_candidate_validation,
+                "prompt_portfolio": not args.disable_prompt_portfolio,
                 "validation_margin": args.validation_margin,
                 "train_n": train_n,
                 "val_n": val_n,
