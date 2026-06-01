@@ -141,13 +141,20 @@ def build_parser() -> argparse.ArgumentParser:
             "direct, plan, self_refine."
         ),
     )
-    parser.add_argument(
-        "--disable-visible-constraint-solver",
+    solver_group = parser.add_mutually_exclusive_group()
+    solver_group.add_argument(
+        "--enable-visible-constraint-solver",
         action="store_true",
         help=(
-            "Disable the deterministic prompt-visible constraint solver for "
-            "mechanical instruction-following requests."
+            "Opt in to the deterministic IFBench-only prompt-visible constraint "
+            "solver for mechanical instruction-following requests. Keep disabled "
+            "for apples-to-apples GAVEL/MIPRO/GEPA comparisons."
         ),
+    )
+    solver_group.add_argument(
+        "--disable-visible-constraint-solver",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--prompt", help="Override the default base prompt.")
     parser.add_argument("--prompt-file", help="Read the base prompt from a file.")
@@ -209,7 +216,7 @@ async def async_main() -> None:
         prompt_complexity_margin=args.prompt_complexity_margin,
         self_refine_rounds=args.self_refine_rounds,
         execution_modes=_parse_execution_modes(args.execution_modes),
-        visible_constraint_solver=not args.disable_visible_constraint_solver,
+        visible_constraint_solver=args.enable_visible_constraint_solver,
         allow_code_execution=args.allow_code_execution,
         show_progress=not args.no_progress,
         base_prompt=base_prompt,
@@ -266,7 +273,7 @@ async def async_main() -> None:
                 "prompt_complexity_margin": args.prompt_complexity_margin,
                 "self_refine_rounds": args.self_refine_rounds,
                 "execution_modes": args.execution_modes,
-                "visible_constraint_solver": not args.disable_visible_constraint_solver,
+                "visible_constraint_solver": args.enable_visible_constraint_solver,
                 "train_n": train_n,
                 "val_n": val_n,
                 "test_n": test_n,

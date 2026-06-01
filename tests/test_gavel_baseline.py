@@ -431,6 +431,8 @@ def test_ifbench_playbook_is_prompt_only():
 
 
 def test_gavel_temperature_validation():
+    assert GavelConfig().visible_constraint_solver is False
+
     with pytest.raises(ValueError, match="temperature must be between 0 and 2"):
         GavelConfig(temperature=2.1).validate()
 
@@ -535,6 +537,38 @@ async def test_visible_constraint_solver_short_circuits_label_free():
     assert stats.deterministic_answers == 1
     assert predictions[0]["prediction"] == "Do this clearly."
     assert predictions[0]["raw_prediction"]["visible_constraint_solver"] is True
+    assert scores[0].passed is True
+
+
+@pytest.mark.asyncio
+async def test_visible_constraint_solver_is_ifbench_scoped():
+    target = FakeTargetClient()
+    example = BenchmarkExample(
+        benchmark_id="other",
+        example_id="other:test:visible",
+        split="test",
+        prompt="The response must start with a verb.",
+        expected_answer="A",
+        metric=MetricKind.EXACT_MATCH,
+        source_url="official",
+    )
+
+    predictions, scores, stats = await evaluate_prompt(
+        prompt=default_base_prompt(),
+        examples=[example],
+        target_client=target,
+        allow_code_execution=False,
+        show_progress=False,
+        workers=1,
+        description="test",
+        phase="test",
+        visible_constraint_solver=True,
+    )
+
+    assert target.calls == 1
+    assert stats.api_calls == 1
+    assert stats.deterministic_answers == 0
+    assert predictions[0]["prediction"] == "A"
     assert scores[0].passed is True
 
 

@@ -70,7 +70,7 @@ class GavelConfig:
     prompt_complexity_margin: float = 0.02
     self_refine_rounds: int = 1
     execution_modes: Tuple[str, ...] = ("direct", "plan", "self_refine")
-    visible_constraint_solver: bool = True
+    visible_constraint_solver: bool = False
     allow_code_execution: bool = False
     show_progress: bool = True
     base_prompt: Optional[str] = None
@@ -428,11 +428,9 @@ async def evaluate_prompt(
                     max_in_flight=stats.max_in_flight,
                 )
             try:
-                visible_output = (
-                    solve_visible_constraints(example.prompt)
-                    if visible_constraint_solver
-                    else None
-                )
+                visible_output = None
+                if visible_constraint_solver and example.benchmark_id == "ifbench":
+                    visible_output = solve_visible_constraints(example.prompt)
                 if visible_output is not None:
                     output = visible_output
                     raw_output = {
