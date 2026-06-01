@@ -141,6 +141,23 @@ def build_parser() -> argparse.ArgumentParser:
             "direct, plan, self_refine."
         ),
     )
+    parser.add_argument(
+        "--pareto-candidates",
+        type=int,
+        default=6,
+        help="Optimizer-proposed GAVEL-Pareto prompt mutations to request before validation.",
+    )
+    parser.add_argument(
+        "--pareto-frontier-size",
+        type=int,
+        default=6,
+        help="Maximum GAVEL-Pareto prompt mutations retained for validation.",
+    )
+    parser.add_argument(
+        "--disable-pareto-search",
+        action="store_true",
+        help="Disable optimizer-proposed GAVEL-Pareto prompt mutation search.",
+    )
     parser.add_argument("--prompt", help="Override the default base prompt.")
     parser.add_argument("--prompt-file", help="Read the base prompt from a file.")
     parser.add_argument(
@@ -201,6 +218,8 @@ async def async_main() -> None:
         prompt_complexity_margin=args.prompt_complexity_margin,
         self_refine_rounds=args.self_refine_rounds,
         execution_modes=_parse_execution_modes(args.execution_modes),
+        pareto_candidates=0 if args.disable_pareto_search else args.pareto_candidates,
+        pareto_frontier_size=args.pareto_frontier_size,
         allow_code_execution=args.allow_code_execution,
         show_progress=not args.no_progress,
         base_prompt=base_prompt,
@@ -257,6 +276,8 @@ async def async_main() -> None:
                 "prompt_complexity_margin": args.prompt_complexity_margin,
                 "self_refine_rounds": args.self_refine_rounds,
                 "execution_modes": args.execution_modes,
+                "pareto_candidates": 0 if args.disable_pareto_search else args.pareto_candidates,
+                "pareto_frontier_size": args.pareto_frontier_size,
                 "train_n": train_n,
                 "val_n": val_n,
                 "test_n": test_n,

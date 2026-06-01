@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
@@ -10,7 +11,6 @@ from pact_el.baselines.gavel import (
     GavelConfig,
     default_base_prompt,
     evaluate_prompt,
-    ifbench_prompt_playbook,
     run_gavel_baseline,
 )
 from pact_el.benchmarks.schemas import BenchmarkExample, BenchmarkSpec, BenchmarkTaskType, MetricKind
@@ -19,8 +19,8 @@ from pact_el.schemas import CallRecord, CallRole
 
 
 class FakeOptimizerClient:
-    def __init__(self, output: str):
-        self.output = output
+    def __init__(self, output: Any):
+        self.outputs = list(output) if isinstance(output, (list, tuple)) else [output]
         self.calls = 0
         self.model = "fake-optimizer"
 
@@ -31,10 +31,11 @@ class FakeOptimizerClient:
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> ClientResponse:
         del messages, response_schema
+        output = self.outputs[min(self.calls, len(self.outputs) - 1)]
         self.calls += 1
         return ClientResponse(
-            output=self.output,
-            raw=self.output,
+            output=output,
+            raw=output,
             call_record=_record(CallRole.OPTIMIZER, "optimizer_compile", metadata),
         )
 
@@ -152,6 +153,32 @@ class PromptPortfolioTargetClient(FakeTargetClient):
         )
 
 
+class ParetoTargetClient(FakeTargetClient):
+    async def complete(
+        self,
+        prompt: str,
+        input: Any,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ClientResponse:
+        self.calls += 1
+        phase = str((metadata or {}).get("phase"))
+        if (metadata or {}).get("canary_id"):
+            output = '{"priority": "urgent"}'
+        elif phase.startswith("validation_gate_pareto_"):
+            output = "4"
+        elif phase == "final_test" and "pareto arithmetic contract" in prompt:
+            output = "4"
+        elif "2+2" in str(input):
+            output = "5"
+        else:
+            output = "A"
+        return ClientResponse(
+            output=output,
+            raw=output,
+            call_record=_record(CallRole.TARGET, "target_complete", metadata),
+        )
+
+
 class SelfRefineTargetClient(FakeTargetClient):
     async def complete(
         self,
@@ -256,6 +283,7 @@ async def test_gavel_baseline_compiles_and_reports_splits(tmp_path, sample_compi
         show_progress=False,
         self_refine_rounds=0,
         execution_modes=("direct",),
+        pareto_candidates=0,
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0"), _numeric_example("gsm8k:train:1")],
@@ -293,6 +321,7 @@ async def test_gavel_validation_gate_rolls_back_regressing_prompt(tmp_path, samp
         validation_gate=True,
         self_refine_rounds=0,
         execution_modes=("direct",),
+        pareto_candidates=0,
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],
@@ -331,6 +360,7 @@ async def test_gavel_validation_gate_can_override_synthetic_canary_rejection(
         prompt_portfolio=False,
         self_refine_rounds=0,
         execution_modes=("direct",),
+        pareto_candidates=0,
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],
@@ -368,6 +398,7 @@ async def test_gavel_validation_gate_can_select_task_strategy_from_portfolio(
         prompt_portfolio=True,
         self_refine_rounds=0,
         execution_modes=("direct",),
+        pareto_candidates=0,
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],
@@ -389,6 +420,70 @@ async def test_gavel_validation_gate_can_select_task_strategy_from_portfolio(
     assert result.summary["split_results"]["test"]["score"] == 1.0
 
 
+@pytest.mark.asyncio
+async def test_gavel_pareto_candidate_can_win_validation(
+    tmp_path,
+    sample_compiler_output,
+):
+    pareto_prompt = (
+        default_base_prompt(_spec())
+        + "\n\n## Pareto Mutation\n"
+        + "- pareto arithmetic contract: compute exact arithmetic and return only the normalized final answer."
+    )
+    mutation_batch = {
+        "mutations": [
+            {
+                "mutation_id": "arith_contract",
+                "title": "Arithmetic contract",
+                "strategy": "decision_rule",
+                "prompt": pareto_prompt,
+                "expected_fixed_behaviors": ["Arithmetic answers use the computed value."],
+                "expected_unchanged_behaviors": ["Return only the requested final answer."],
+                "risk_notes": ["May be too terse for tasks that ask for explanations."],
+                "evidence_ids": ["train_gsm8k:train:0"],
+                "confidence": 0.8,
+                "expected_gain": 0.9,
+                "regression_risk": 0.1,
+            }
+        ],
+        "no_mutation_reason": None,
+    }
+    config = GavelConfig(
+        model="fake-target",
+        optimizer_model="fake-optimizer",
+        output_dir=tmp_path,
+        cache=False,
+        workers=2,
+        show_progress=False,
+        validation_gate=True,
+        prompt_portfolio=True,
+        self_refine_rounds=0,
+        execution_modes=("direct",),
+        pareto_candidates=3,
+        pareto_frontier_size=2,
+    )
+    result = await run_gavel_baseline(
+        train_examples=[_numeric_example("gsm8k:train:0")],
+        val_examples=[_numeric_example("gsm8k:validation:0")],
+        test_examples=[_numeric_example("gsm8k:test:0")],
+        config=config,
+        benchmark_spec=_spec(),
+        optimizer_client=FakeOptimizerClient(
+            [sample_compiler_output.model_dump_json(), json.dumps(mutation_batch)]
+        ),
+        target_client=ParetoTargetClient(),
+    )
+
+    gate = result.summary["validation_gate"]
+    assert result.summary["method"] == "gavel_pareto"
+    assert result.summary["optimizer"] == "gavel_pareto"
+    assert result.summary["selected_prompt"].startswith("pareto_")
+    assert result.summary["decision"] == "validation_selected_pareto"
+    assert result.summary["pareto_search"]["selected"] == 1
+    assert gate["candidate_source"] == "pareto:decision_rule"
+    assert result.summary["split_results"]["test"]["score"] == 1.0
+
+
 def test_default_base_prompt_is_benchmark_specific():
     prompt = default_base_prompt(_spec())
     assert "benchmark-solving" in prompt
@@ -406,29 +501,6 @@ def test_default_base_prompt_is_benchmark_specific():
         assert heading in prompt
 
 
-def test_ifbench_playbook_is_prompt_only():
-    prompt = ifbench_prompt_playbook(
-        BenchmarkSpec(
-            benchmark_id="ifbench",
-            display_name="IFBench",
-            task_type=BenchmarkTaskType.INSTRUCTION_FOLLOWING,
-            adapter="ifbench",
-            default_split="test",
-            metrics=[MetricKind.OFFICIAL_EVALUATOR],
-            official_url="official",
-            source_url="official",
-            evaluator="official",
-            sources=[],
-            description="Instruction following.",
-        )
-    )
-
-    assert prompt is not None
-    assert "Do not rely on hidden benchmark metadata" in prompt
-    assert "instruction_id_list" not in prompt
-    assert "kwargs" not in prompt
-
-
 def test_gavel_temperature_validation():
     with pytest.raises(ValueError, match="temperature must be between 0 and 2"):
         GavelConfig(temperature=2.1).validate()
@@ -441,6 +513,9 @@ def test_gavel_temperature_validation():
 
     with pytest.raises(ValueError, match="self_refine_rounds must be non-negative"):
         GavelConfig(self_refine_rounds=-1).validate()
+
+    with pytest.raises(ValueError, match="pareto_candidates must be non-negative"):
+        GavelConfig(pareto_candidates=-1).validate()
 
     with pytest.raises(ValueError, match="execution mode must be one of"):
         GavelConfig(execution_modes=("unsupported",)).validate()
@@ -520,6 +595,7 @@ async def test_gavel_validation_gate_can_select_execution_mode(
         prompt_portfolio=False,
         self_refine_rounds=0,
         execution_modes=("direct", "plan"),
+        pareto_candidates=0,
     )
     result = await run_gavel_baseline(
         train_examples=[_numeric_example("gsm8k:train:0")],

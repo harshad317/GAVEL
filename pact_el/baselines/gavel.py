@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import math
+import re
 import statistics
 import threading
 from collections import Counter
@@ -14,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from pydantic import Field, ValidationError
 from tqdm.auto import tqdm
 
 from pact_el.benchmarks.scoring import (
@@ -36,9 +38,10 @@ from pact_el.clients import (
     OptimizerClient,
     TargetClient,
 )
+from pact_el.compiler import strict_parse_json_model
 from pact_el.optimize import pact_optimize
 from pact_el.renderer import estimate_token_count, render_prompt
-from pact_el.schemas import CallRecord, CallRole, ContractArea
+from pact_el.schemas import CallRecord, CallRole, ContractArea, StrictModel
 
 
 @dataclass
@@ -69,6 +72,8 @@ class GavelConfig:
     prompt_complexity_margin: float = 0.02
     self_refine_rounds: int = 1
     execution_modes: Tuple[str, ...] = ("direct", "plan", "self_refine")
+    pareto_candidates: int = 6
+    pareto_frontier_size: int = 6
     allow_code_execution: bool = False
     show_progress: bool = True
     base_prompt: Optional[str] = None
@@ -90,6 +95,10 @@ class GavelConfig:
             raise ValueError("prompt_complexity_margin must be between 0 and 1")
         if self.self_refine_rounds < 0:
             raise ValueError("self_refine_rounds must be non-negative")
+        if self.pareto_candidates < 0:
+            raise ValueError("pareto_candidates must be non-negative")
+        if self.pareto_frontier_size < 0:
+            raise ValueError("pareto_frontier_size must be non-negative")
         _resolve_execution_modes(self.execution_modes, self.self_refine_rounds)
 
 
@@ -175,6 +184,38 @@ class EvaluationCandidate:
         return _evaluation_candidate_key(self.prompt_name, self.execution_mode)
 
 
+class ParetoPromptMutation(StrictModel):
+    """One optimizer-proposed prompt candidate for validation selection."""
+
+    mutation_id: str
+    title: str
+    strategy: str
+    prompt: str
+    expected_fixed_behaviors: List[str] = Field(default_factory=list)
+    expected_unchanged_behaviors: List[str] = Field(default_factory=list)
+    risk_notes: List[str] = Field(default_factory=list)
+    evidence_ids: List[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    expected_gain: float = Field(default=0.5, ge=0.0, le=1.0)
+    regression_risk: float = Field(default=0.25, ge=0.0, le=1.0)
+
+
+class ParetoPromptMutationBatch(StrictModel):
+    """Schema returned by the GAVEL-Pareto prompt mutation step."""
+
+    mutations: List[ParetoPromptMutation] = Field(default_factory=list)
+    no_mutation_reason: Optional[str] = None
+
+
+@dataclass
+class ParetoSearchResult:
+    """Optimizer-proposed prompt candidates and run metadata."""
+
+    candidates: List[PromptCandidate]
+    api_calls: int
+    summary: Dict[str, Any]
+
+
 async def run_gavel_baseline(
     *,
     train_examples: Sequence[BenchmarkExample],
@@ -234,11 +275,25 @@ async def run_gavel_baseline(
         allow_one_repair=config.allow_one_repair,
         canary_concurrency=config.workers,
     )
+    pareto_search = await _generate_pareto_prompt_candidates(
+        base_prompt=base_prompt,
+        benchmark_spec=benchmark_spec,
+        report=report,
+        logs=logs,
+        optimizer_client=optimizer_client,
+        max_candidates=(
+            config.pareto_candidates
+            if config.prompt_portfolio and config.validation_gate
+            else 0
+        ),
+        frontier_size=config.pareto_frontier_size,
+    )
     prompt_candidates = _build_prompt_candidates(
         base_prompt=base_prompt,
         report=report,
         benchmark_spec=benchmark_spec,
         logs=logs,
+        pareto_candidates=pareto_search.candidates,
         enabled=config.prompt_portfolio,
         validate_rejected_candidates=config.validate_rejected_candidates,
     )
@@ -260,6 +315,7 @@ async def run_gavel_baseline(
     )
     report.metadata = {
         **report.metadata,
+        "pareto_search": pareto_search.summary,
         "validation_gate": prompt_selection.summary(),
     }
     optimized_prompt = prompt_selection.prompt
@@ -295,6 +351,7 @@ async def run_gavel_baseline(
     optimization_api_calls = (
         evidence_stats.api_calls
         + report.call_ledger.total_calls
+        + pareto_search.api_calls
         + prompt_selection.api_calls
     )
     split_results["optimization"] = {
@@ -313,10 +370,11 @@ async def run_gavel_baseline(
             for split_eval in split_evaluations.values()
         ]
     )
+    method_label = "gavel_pareto" if pareto_search.summary.get("enabled") else "gavel"
     summary = {
         **summarize_scores(scores),
-        "method": "gavel",
-        "optimizer": "gavel",
+        "method": method_label,
+        "optimizer": method_label,
         "model": config.model,
         "optimizer_model": _optimizer_model(config),
         "temperature": config.temperature,
@@ -331,6 +389,9 @@ async def run_gavel_baseline(
         "cache": config.cache,
         "budget": config.budget,
         "prompt_portfolio": config.prompt_portfolio,
+        "pareto_candidates": config.pareto_candidates,
+        "pareto_frontier_size": config.pareto_frontier_size,
+        "pareto_search": pareto_search.summary,
         "self_refine_rounds": config.self_refine_rounds,
         "execution_modes": list(execution_modes),
         "validation_confidence_z": config.validation_confidence_z,
@@ -1017,48 +1078,6 @@ def constraint_solver_prompt(spec: Optional[BenchmarkSpec] = None) -> str:
     return _render_structured_sections(sections)
 
 
-def ifbench_prompt_playbook(spec: Optional[BenchmarkSpec] = None) -> Optional[str]:
-    """Prompt-only IFBench strategy candidate.
-
-    The playbook is intentionally limited to instructions that are visible in the
-    user prompt. It does not use normalized example metadata, instruction ids, or
-    evaluator arguments at inference time.
-    """
-
-    if spec is None or spec.benchmark_id != "ifbench":
-        return None
-    sections = _default_prompt_sections(spec)
-    _extend_section(
-        sections,
-        "Role",
-        [
-            "Act as a visible-prompt instruction solver: read only the user prompt, infer every mechanical rule from the text, and produce the simplest answer that satisfies those rules.",
-        ],
-    )
-    _extend_section(
-        sections,
-        "Task",
-        _ifbench_visible_prompt_playbook_items(),
-    )
-    _extend_section(
-        sections,
-        "Constraints",
-        [
-            "Do not rely on hidden benchmark metadata, labels, instruction ids, checker arguments, or scorer feedback.",
-            "When a visible mechanical constraint conflicts with a rich answer, keep the mechanical constraint exact and make the answer as short as the prompt permits.",
-            "For impossible-looking style requests, prefer a minimal verifier-visible answer over a fluent answer that violates counts, positions, formatting, or word-property rules.",
-        ],
-    )
-    _extend_section(
-        sections,
-        "Quality Bar",
-        [
-            "Before returning, privately rerun the exact checks described in the visible prompt text and revise the final answer until the checks pass.",
-        ],
-    )
-    return _render_structured_sections(sections)
-
-
 def evidence_strategy_prompt(
     spec: Optional[BenchmarkSpec],
     logs: Sequence[Mapping[str, Any]],
@@ -1067,8 +1086,6 @@ def evidence_strategy_prompt(
     if not summary:
         return None
     sections = _default_prompt_sections(spec)
-    if spec is not None and spec.benchmark_id == "ifbench":
-        _extend_section(sections, "Task", _ifbench_visible_prompt_playbook_items())
     _extend_section(
         sections,
         "Context",
@@ -1093,35 +1110,6 @@ def evidence_strategy_prompt(
         ],
     )
     return _render_structured_sections(sections)
-
-
-def _ifbench_visible_prompt_playbook_items() -> List[str]:
-    return [
-        "If the prompt specifies exact keyword counts such as one/two/three/five/seven times, draft a controlled short answer and count each literal keyword occurrence case-insensitively; avoid using the keyword inside any other word.",
-        "If the prompt says the response must start with a verb, start with a plain imperative verb phrase such as `Give ...` or `Consider ...`, then continue the answer.",
-        "If every word must have a consonant cluster, use only words whose spelling contains adjacent consonants, such as strengths, scripts, crafts, trends, glyphs, prompts, trusts, blends.",
-        "If words must alternate odd/even syllables, either produce one compliant word when the prompt allows a very short answer, or build the whole answer from a checked odd-even word sequence.",
-        "If words may use only a limited set of vowel types, restrict the whole answer to words using a small vowel set, such as `red pen met` for vowel e only.",
-        "If only prime-length words are allowed, use short words with 2, 3, 5, 7, 11, or 13 letters; reject every 1, 4, 6, 8, 9, 10, 12, 14, and 15 letter word.",
-        "If each word must start with the next alphabet letter, choose a short alphabetic sequence such as `Alpha bravo charlie delta echo`; continue cyclically only if more words are needed.",
-        "If no two consecutive words can share a first letter, scan adjacent words after punctuation is removed and replace any collision.",
-        "If the second word and second-to-last word must be a keyword, place the keyword as token 2 and as the penultimate token before final punctuation.",
-        "If a keyword must appear in sentence N or as word M of sentence N, first create exactly enough sentences; in sentence N count punctuation-stripped words and place the keyword at the required position.",
-        "If sentence word counts must increment by n, choose a small base count and build sentences with counts base, base+n, base+2n, then count punctuation-stripped words.",
-        "If sentence types must be balanced, use equal counts of sentences ending `.`, `?`, and `!`; if the requested ratio is 2:1 declarative to interrogative, use two `.` sentences and one `?` sentence.",
-        "If three sentences must have the same character count, use a known equal-length skeleton such as `Cat sat. Dog ran. Fox hid.` and preserve exactly three sentences.",
-        "If the last word of each sentence must become the first word of the next, write the boundary chain first, for example `Alpha beta. Beta gamma.`",
-        "If each paragraph must end with its first word, draft each paragraph as `Alpha ... alpha` and separate paragraphs with a newline.",
-        "If the prompt asks for a copied character span by start/end indices, copy exactly that substring from the referenced request and output only the substring.",
-        "If the prompt asks to repeat the request but change the first word, output the repeated request with only the first word changed and do not answer the request.",
-        "If every word must be on a new line, put one visible word per line and do not include extra prose.",
-        "If indentation must increase, write multiple short lines with strictly more leading spaces on each next line.",
-        "If every sentence must end with an emoji, put an emoji immediately at the end of every sentence.",
-        "If all punctuation marks are required, include `.`, `,`, `!`, `?`, `;`, `:`, and an interrobang sequence `?!` at least once.",
-        "If answer options are provided with no explanation, output exactly one option string and nothing else.",
-        "If a no-whitespace output is requested, remove every space, tab, and newline.",
-        "If a trigram-overlap percentage is requested, preserve exact wording from the reference text for high percentages; for low percentages, keep the answer short and include only a small number of exact reference phrases.",
-    ]
 
 
 def _default_prompt_sections(
@@ -1477,6 +1465,416 @@ class CachedOptimizerClient:
         return response
 
 
+async def _generate_pareto_prompt_candidates(
+    *,
+    base_prompt: str,
+    benchmark_spec: Optional[BenchmarkSpec],
+    report: Any,
+    logs: Sequence[Mapping[str, Any]],
+    optimizer_client: OptimizerClient,
+    max_candidates: int,
+    frontier_size: int,
+) -> ParetoSearchResult:
+    requested = max(0, max_candidates)
+    frontier_limit = max(0, min(frontier_size, requested))
+    if requested == 0 or frontier_limit == 0:
+        return ParetoSearchResult(
+            candidates=[],
+            api_calls=0,
+            summary={
+                "enabled": False,
+                "requested_candidates": requested,
+                "frontier_size": frontier_limit,
+                "proposed": 0,
+                "selected": 0,
+                "api_calls": 0,
+                "reason": "pareto search disabled",
+            },
+        )
+
+    response = await optimizer_client.complete(
+        _build_pareto_mutation_messages(
+            base_prompt=base_prompt,
+            benchmark_spec=benchmark_spec,
+            report=report,
+            logs=logs,
+            max_candidates=requested,
+        ),
+        response_schema=ParetoPromptMutationBatch.model_json_schema(),
+        metadata={
+            "phase": "pareto_prompt_mutations",
+            "max_candidates": requested,
+            "frontier_size": frontier_limit,
+        },
+    )
+    api_calls = 1
+    try:
+        batch = strict_parse_json_model(ParetoPromptMutationBatch, response.output)
+    except (TypeError, ValueError, ValidationError) as exc:
+        return ParetoSearchResult(
+            candidates=[],
+            api_calls=api_calls,
+            summary={
+                "enabled": True,
+                "requested_candidates": requested,
+                "frontier_size": frontier_limit,
+                "proposed": 0,
+                "selected": 0,
+                "api_calls": api_calls,
+                "error": "mutation_schema_error",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            },
+        )
+
+    mutations = _sanitize_pareto_mutations(
+        batch.mutations,
+        base_prompt=base_prompt,
+        max_candidates=requested,
+    )
+    frontier = _pareto_frontier(mutations, base_prompt=base_prompt)
+    ranked = _rank_pareto_mutations(frontier or mutations, base_prompt=base_prompt)
+    selected = ranked[:frontier_limit]
+    candidates = [
+        _pareto_mutation_candidate(mutation, index=index)
+        for index, mutation in enumerate(selected, start=1)
+    ]
+    return ParetoSearchResult(
+        candidates=candidates,
+        api_calls=api_calls,
+        summary={
+            "enabled": True,
+            "requested_candidates": requested,
+            "frontier_size": frontier_limit,
+            "proposed": len(batch.mutations),
+            "valid": len(mutations),
+            "frontier": len(frontier),
+            "selected": len(candidates),
+            "api_calls": api_calls,
+            "no_mutation_reason": batch.no_mutation_reason,
+            "candidates": [
+                _pareto_mutation_summary(mutation, candidate.name)
+                for mutation, candidate in zip(selected, candidates)
+            ],
+        },
+    )
+
+
+def _build_pareto_mutation_messages(
+    *,
+    base_prompt: str,
+    benchmark_spec: Optional[BenchmarkSpec],
+    report: Any,
+    logs: Sequence[Mapping[str, Any]],
+    max_candidates: int,
+) -> List[Dict[str, str]]:
+    schema = json.dumps(
+        ParetoPromptMutationBatch.model_json_schema(),
+        indent=2,
+        sort_keys=True,
+    )
+    evidence_payload = json.dumps(
+        _pareto_evidence_payload(logs),
+        indent=2,
+        sort_keys=True,
+    )
+    report_payload = json.dumps(
+        _pareto_report_payload(report),
+        indent=2,
+        sort_keys=True,
+    )
+    spec_payload = json.dumps(
+        _pareto_spec_payload(benchmark_spec),
+        indent=2,
+        sort_keys=True,
+    )
+    system = (
+        "You are GAVEL-Pareto, a general prompt optimizer. Generate a small "
+        "Pareto frontier of transferable runtime prompts from training evidence. "
+        "Optimize for validation performance, broad transfer, low regression risk, "
+        "short prompts, and diversity of behavioral contracts. Return only JSON "
+        "matching the schema."
+    )
+    user = f"""
+GAVEL-Pareto mutation request
+
+Objective:
+- Propose at most {max_candidates} complete runtime prompts.
+- Each prompt must be a general candidate for unseen validation/test examples, not a benchmark-specific solver.
+- Use training failures to infer reusable behavioral contracts, output-shape policies, reasoning policies, demo policies, or anti-patterns.
+- Keep successful training rows as regression constraints.
+- Do not copy training answers, example ids, labels, hidden evaluator kwargs, or per-example expected outputs into runtime prompts.
+- Do not rely on scorer internals, benchmark metadata unavailable to the target model, or any held-out validation/test information.
+- Prefer candidates that are mutually diverse: one may be compact, one may be stricter about output format, one may add a self-check policy, one may add task-type-specific decision rules.
+- A candidate is useful only if a normal target model can execute it from the current user prompt alone.
+- Return complete prompts, not diffs. Preserve the eight-section style when possible: Goal, Context, Role, Input, Task, Constraints, Output Format, Quality Bar.
+
+Base runtime prompt:
+{_truncate_text(base_prompt, max_chars=12000)}
+
+Benchmark/task summary:
+{spec_payload}
+
+Compiled GAVEL report summary:
+{report_payload}
+
+Training evidence summary:
+{json.dumps(_summarize_evidence_patterns(logs), indent=2, sort_keys=True)}
+
+Compact training evidence:
+{evidence_payload}
+
+Required JSON schema:
+{schema}
+""".strip()
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _pareto_spec_payload(spec: Optional[BenchmarkSpec]) -> Dict[str, Any]:
+    if spec is None:
+        return {}
+    return {
+        "benchmark_id": spec.benchmark_id,
+        "display_name": spec.display_name,
+        "task_type": spec.task_type.value,
+        "metrics": [
+            metric.value if isinstance(metric, MetricKind) else str(metric)
+            for metric in spec.metrics
+        ],
+        "description": spec.description,
+        "evaluator": spec.evaluator,
+    }
+
+
+def _pareto_report_payload(report: Any) -> Dict[str, Any]:
+    decision = getattr(report, "decision", None)
+    patch = getattr(report, "patch", None)
+    defects = []
+    for defect in list(getattr(report, "defect_posterior", []) or [])[:6]:
+        dumped = defect.model_dump(mode="json") if hasattr(defect, "model_dump") else dict(defect)
+        defects.append(_compact_value(dumped, max_chars=500))
+    payload: Dict[str, Any] = {
+        "accepted": bool(getattr(report, "accepted", False)),
+        "decision": getattr(decision, "value", str(decision)),
+        "notes": [_truncate_text(str(note), max_chars=400) for note in list(getattr(report, "notes", []) or [])[:8]],
+        "defect_posterior": defects,
+    }
+    if patch is not None:
+        payload["patch"] = {
+            "summary": _truncate_text(str(getattr(patch, "summary", "")), max_chars=500),
+            "expected_fixed_behaviors": [
+                _truncate_text(str(item), max_chars=240)
+                for item in list(getattr(patch, "expected_fixed_behaviors", []) or [])[:8]
+            ],
+            "expected_unchanged_behaviors": [
+                _truncate_text(str(item), max_chars=240)
+                for item in list(getattr(patch, "expected_unchanged_behaviors", []) or [])[:8]
+            ],
+            "regression_risks": [
+                _truncate_text(str(item), max_chars=240)
+                for item in list(getattr(patch, "regression_risks", []) or [])[:8]
+            ],
+        }
+    return payload
+
+
+def _pareto_evidence_payload(logs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    failures = [row for row in logs if row.get("passed") is False]
+    successes = [row for row in logs if row.get("passed") is True]
+    selected = failures[:12] + successes[:4]
+    payload: List[Dict[str, Any]] = []
+    for row in selected:
+        metadata = dict(row.get("metadata") or {})
+        payload.append(
+            {
+                "evidence_id": row.get("evidence_id"),
+                "passed": row.get("passed"),
+                "area": row.get("area"),
+                "severity": row.get("severity"),
+                "prompt_fixability": row.get("prompt_fixability"),
+                "input": _truncate_text(str(row.get("input") or ""), max_chars=1000),
+                "expected": _truncate_text(str(row.get("expected") or ""), max_chars=700),
+                "observed": _truncate_text(str(row.get("observed") or ""), max_chars=900),
+                "metadata": _compact_value(
+                    {
+                        key: value
+                        for key, value in metadata.items()
+                        if key
+                        in {
+                            "metric",
+                            "diagnostics",
+                            "choices",
+                            "public_tests",
+                            "failed_instruction_ids",
+                        }
+                    },
+                    max_chars=500,
+                ),
+            }
+        )
+    return payload
+
+
+def _sanitize_pareto_mutations(
+    mutations: Sequence[ParetoPromptMutation],
+    *,
+    base_prompt: str,
+    max_candidates: int,
+) -> List[ParetoPromptMutation]:
+    seen = {base_prompt.strip()}
+    sanitized: List[ParetoPromptMutation] = []
+    for mutation in mutations:
+        prompt = mutation.prompt.strip()
+        if not prompt or prompt in seen:
+            continue
+        seen.add(prompt)
+        sanitized.append(
+            mutation.model_copy(
+                update={
+                    "mutation_id": _slug(mutation.mutation_id) or f"mutation_{len(sanitized) + 1}",
+                    "title": _truncate_text(mutation.title.strip() or "Pareto prompt mutation", max_chars=100),
+                    "strategy": _truncate_text(mutation.strategy.strip() or "general", max_chars=80),
+                    "prompt": _truncate_text(prompt, max_chars=60000),
+                }
+            )
+        )
+        if len(sanitized) >= max_candidates:
+            break
+    return sanitized
+
+
+def _pareto_frontier(
+    mutations: Sequence[ParetoPromptMutation],
+    *,
+    base_prompt: str,
+) -> List[ParetoPromptMutation]:
+    frontier: List[ParetoPromptMutation] = []
+    for candidate in mutations:
+        if any(_pareto_dominates(other, candidate, base_prompt=base_prompt) for other in mutations if other is not candidate):
+            continue
+        frontier.append(candidate)
+    return frontier
+
+
+def _pareto_dominates(
+    left: ParetoPromptMutation,
+    right: ParetoPromptMutation,
+    *,
+    base_prompt: str,
+) -> bool:
+    left_values = _pareto_objectives(left, base_prompt=base_prompt)
+    right_values = _pareto_objectives(right, base_prompt=base_prompt)
+    better_or_equal = all(left_values[key] >= right_values[key] for key in left_values)
+    strictly_better = any(left_values[key] > right_values[key] for key in left_values)
+    return better_or_equal and strictly_better
+
+
+def _pareto_objectives(
+    mutation: ParetoPromptMutation,
+    *,
+    base_prompt: str,
+) -> Dict[str, float]:
+    prompt_tokens = max(1, estimate_token_count(mutation.prompt))
+    base_tokens = max(1, estimate_token_count(base_prompt))
+    token_ratio = prompt_tokens / base_tokens
+    return {
+        "expected_gain": float(mutation.expected_gain),
+        "confidence": float(mutation.confidence),
+        "support": min(1.0, len(mutation.evidence_ids) / 8.0),
+        "low_regression": 1.0 - float(mutation.regression_risk),
+        "compactness": 1.0 / max(1.0, token_ratio),
+    }
+
+
+def _rank_pareto_mutations(
+    mutations: Sequence[ParetoPromptMutation],
+    *,
+    base_prompt: str,
+) -> List[ParetoPromptMutation]:
+    by_strategy: Dict[str, List[ParetoPromptMutation]] = {}
+    for mutation in mutations:
+        by_strategy.setdefault(_slug(mutation.strategy) or "general", []).append(mutation)
+    for strategy, items in by_strategy.items():
+        by_strategy[strategy] = sorted(items, key=lambda item: _pareto_rank_key(item, base_prompt=base_prompt), reverse=True)
+    ranked: List[ParetoPromptMutation] = []
+    while by_strategy:
+        for strategy in list(by_strategy):
+            items = by_strategy[strategy]
+            if not items:
+                del by_strategy[strategy]
+                continue
+            ranked.append(items.pop(0))
+    return sorted(ranked, key=lambda item: _pareto_rank_key(item, base_prompt=base_prompt), reverse=True)
+
+
+def _pareto_rank_key(
+    mutation: ParetoPromptMutation,
+    *,
+    base_prompt: str,
+) -> tuple[float, float, float, int]:
+    objectives = _pareto_objectives(mutation, base_prompt=base_prompt)
+    score = (
+        0.40 * objectives["expected_gain"]
+        + 0.20 * objectives["confidence"]
+        + 0.15 * objectives["support"]
+        + 0.15 * objectives["low_regression"]
+        + 0.10 * objectives["compactness"]
+    )
+    return (
+        score,
+        objectives["expected_gain"],
+        objectives["low_regression"],
+        -estimate_token_count(mutation.prompt),
+    )
+
+
+def _pareto_mutation_candidate(
+    mutation: ParetoPromptMutation,
+    *,
+    index: int,
+) -> PromptCandidate:
+    slug = _slug(mutation.title) or _slug(mutation.mutation_id) or "mutation"
+    return PromptCandidate(
+        name=f"pareto_{index}_{slug[:28]}",
+        prompt=mutation.prompt,
+        source=f"pareto:{_slug(mutation.strategy) or 'general'}",
+        report_decision="validation_selected_pareto",
+        report_accepted=False,
+    )
+
+
+def _pareto_mutation_summary(
+    mutation: ParetoPromptMutation,
+    candidate_name: str,
+) -> Dict[str, Any]:
+    return {
+        "candidate": candidate_name,
+        "mutation_id": mutation.mutation_id,
+        "title": mutation.title,
+        "strategy": mutation.strategy,
+        "expected_gain": mutation.expected_gain,
+        "confidence": mutation.confidence,
+        "regression_risk": mutation.regression_risk,
+        "evidence_ids": list(mutation.evidence_ids[:12]),
+        "prompt_tokens": estimate_token_count(mutation.prompt),
+        "expected_fixed_behaviors": [
+            _truncate_text(str(item), max_chars=180)
+            for item in mutation.expected_fixed_behaviors[:6]
+        ],
+        "risk_notes": [
+            _truncate_text(str(item), max_chars=180)
+            for item in mutation.risk_notes[:6]
+        ],
+    }
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
 async def _select_prompt_with_validation(
     *,
     base_prompt: str,
@@ -1693,6 +2091,8 @@ async def _select_prompt_with_validation(
     if best_metric + 1e-12 >= base_metric + best_required_margin and paired_ok:
         if best_candidate.prompt_name == "base":
             decision = "validation_selected_execution_mode"
+        elif best_candidate.source.startswith("pareto:"):
+            decision = best_candidate.report_decision
         else:
             decision = (
                 best_candidate.report_decision
@@ -1741,6 +2141,7 @@ def _build_prompt_candidates(
     report: Any,
     benchmark_spec: Optional[BenchmarkSpec],
     logs: Sequence[Mapping[str, Any]],
+    pareto_candidates: Sequence[PromptCandidate],
     enabled: bool,
     validate_rejected_candidates: bool,
 ) -> List[PromptCandidate]:
@@ -1776,16 +2177,7 @@ def _build_prompt_candidates(
             report_decision="validation_selected_constraint_solver",
         )
     ]
-    playbook_prompt = ifbench_prompt_playbook(benchmark_spec)
-    if playbook_prompt is not None:
-        candidates.append(
-            PromptCandidate(
-                name="ifbench_playbook",
-                prompt=playbook_prompt,
-                source="deterministic_ifbench_playbook",
-                report_decision="validation_selected_ifbench_playbook",
-            )
-        )
+    candidates.extend(pareto_candidates)
     evidence_prompt = evidence_strategy_prompt(benchmark_spec, logs)
     if evidence_prompt is not None:
         candidates.append(
@@ -1851,10 +2243,11 @@ def _preferred_candidate(candidates: Sequence[PromptCandidate]) -> Optional[Prom
 
 
 def _candidate_priority(candidate: PromptCandidate) -> int:
+    if candidate.name.startswith("pareto_") or candidate.source.startswith("pareto:"):
+        return 4
     priorities = {
         "optimized": 3,
         "constraint_solver": 3,
-        "ifbench_playbook": 3,
         "evidence_strategy": 2,
         "task_strategy": 1,
     }
