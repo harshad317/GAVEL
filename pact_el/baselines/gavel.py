@@ -37,6 +37,7 @@ from pact_el.clients import (
     LiteLLMTargetClient,
     OptimizerClient,
     TargetClient,
+    _openai_strict_response_schema,
 )
 from pact_el.compiler import strict_parse_json_model
 from pact_el.optimize import pact_optimize
@@ -191,20 +192,20 @@ class ParetoPromptMutation(StrictModel):
     title: str
     strategy: str
     prompt: str
-    expected_fixed_behaviors: List[str] = Field(default_factory=list)
-    expected_unchanged_behaviors: List[str] = Field(default_factory=list)
-    risk_notes: List[str] = Field(default_factory=list)
-    evidence_ids: List[str] = Field(default_factory=list)
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    expected_gain: float = Field(default=0.5, ge=0.0, le=1.0)
-    regression_risk: float = Field(default=0.25, ge=0.0, le=1.0)
+    expected_fixed_behaviors: List[str]
+    expected_unchanged_behaviors: List[str]
+    risk_notes: List[str]
+    evidence_ids: List[str]
+    confidence: float = Field(ge=0.0, le=1.0)
+    expected_gain: float = Field(ge=0.0, le=1.0)
+    regression_risk: float = Field(ge=0.0, le=1.0)
 
 
 class ParetoPromptMutationBatch(StrictModel):
     """Schema returned by the GAVEL-Pareto prompt mutation step."""
 
-    mutations: List[ParetoPromptMutation] = Field(default_factory=list)
-    no_mutation_reason: Optional[str] = None
+    mutations: List[ParetoPromptMutation]
+    no_mutation_reason: Optional[str]
 
 
 @dataclass
@@ -1569,7 +1570,7 @@ def _build_pareto_mutation_messages(
     max_candidates: int,
 ) -> List[Dict[str, str]]:
     schema = json.dumps(
-        ParetoPromptMutationBatch.model_json_schema(),
+        _openai_strict_response_schema(ParetoPromptMutationBatch.model_json_schema()),
         indent=2,
         sort_keys=True,
     )
@@ -1608,6 +1609,7 @@ Objective:
 - Prefer candidates that are mutually diverse: one may be compact, one may be stricter about output format, one may add a self-check policy, one may add task-type-specific decision rules.
 - A candidate is useful only if a normal target model can execute it from the current user prompt alone.
 - Return complete prompts, not diffs. Preserve the eight-section style when possible: Goal, Context, Role, Input, Task, Constraints, Output Format, Quality Bar.
+- Include every schema field. Use [] for empty lists and null for no_mutation_reason when mutations are present.
 
 Base runtime prompt:
 {_truncate_text(base_prompt, max_chars=12000)}

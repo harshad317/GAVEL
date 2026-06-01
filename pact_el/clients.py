@@ -136,23 +136,43 @@ class LiteLLMOptimizerClient:
             ) from exc
 
         kwargs: Dict[str, Any] = dict(self.extra_kwargs)
-        if response_schema is not None:
-            kwargs.setdefault(
-                "response_format",
-                _response_format_for_schema(response_schema),
-            )
+        generated_response_format: Optional[Dict[str, Any]] = None
+        used_json_schema_fallback = False
+        if response_schema is not None and "response_format" not in kwargs:
+            generated_response_format = _response_format_for_schema(response_schema)
+            kwargs["response_format"] = generated_response_format
 
         started_at = datetime.now(timezone.utc)
         started = time.perf_counter()
-        response = await litellm.acompletion(
-            model=self.model,
-            messages=list(messages),
-            temperature=self.temperature,
-            **kwargs,
-        )
+        try:
+            response = await litellm.acompletion(
+                model=self.model,
+                messages=list(messages),
+                temperature=self.temperature,
+                **kwargs,
+            )
+        except Exception as exc:
+            if not (
+                generated_response_format is not None
+                and generated_response_format.get("type") == "json_schema"
+                and _is_response_schema_error(exc)
+            ):
+                raise
+            kwargs = dict(kwargs)
+            kwargs["response_format"] = {"type": "json_object"}
+            used_json_schema_fallback = True
+            response = await litellm.acompletion(
+                model=self.model,
+                messages=list(messages),
+                temperature=self.temperature,
+                **kwargs,
+            )
         elapsed_ms = (time.perf_counter() - started) * 1000
         message = response["choices"][0]["message"]["content"]
         usage = response.get("usage") or {}
+        record_metadata = {**dict(metadata or {}), "latency_ms": elapsed_ms}
+        if used_json_schema_fallback:
+            record_metadata["response_schema_fallback"] = "json_object"
         record = CallRecord(
             role=CallRole.OPTIMIZER,
             name="optimizer_compile",
@@ -163,7 +183,7 @@ class LiteLLMOptimizerClient:
             cached=False,
             started_at=started_at,
             finished_at=datetime.now(timezone.utc),
-            metadata={**dict(metadata or {}), "latency_ms": elapsed_ms},
+            metadata=record_metadata,
         )
         return ClientResponse(output=message, call_record=record, raw=response)
 
@@ -175,10 +195,39 @@ def _response_format_for_schema(response_schema: Mapping[str, Any]) -> Dict[str,
         "type": "json_schema",
         "json_schema": {
             "name": "pact_el_compiler_output",
-            "schema": response_schema,
+            "schema": _openai_strict_response_schema(response_schema),
             "strict": True,
         },
     }
+
+
+def _openai_strict_response_schema(schema: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize a closed JSON schema for OpenAI strict structured outputs."""
+
+    normalized = _normalize_openai_strict_node(schema)
+    if not isinstance(normalized, dict):
+        raise TypeError("response schema must normalize to a JSON object")
+    return normalized
+
+
+def _normalize_openai_strict_node(schema: Any) -> Any:
+    if isinstance(schema, Mapping):
+        normalized: Dict[str, Any] = {}
+        for key, value in schema.items():
+            if key == "default":
+                continue
+            normalized[key] = _normalize_openai_strict_node(value)
+        properties = normalized.get("properties")
+        if (
+            normalized.get("type") == "object"
+            and isinstance(properties, Mapping)
+            and normalized.get("additionalProperties") is False
+        ):
+            normalized["required"] = list(properties.keys())
+        return normalized
+    if isinstance(schema, list):
+        return [_normalize_openai_strict_node(value) for value in schema]
+    return schema
 
 
 def _has_open_object_schema(schema: Any) -> bool:
@@ -189,6 +238,11 @@ def _has_open_object_schema(schema: Any) -> bool:
     if isinstance(schema, list):
         return any(_has_open_object_schema(value) for value in schema)
     return False
+
+
+def _is_response_schema_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "response_format" in message and "schema" in message
 
 
 class LiteLLMTargetClient:

@@ -72,3 +72,68 @@ async def test_optimizer_client_uses_strict_json_schema_for_closed_schemas(monke
             "strict": True,
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_optimizer_client_normalizes_closed_schema_for_openai_strict_mode(monkeypatch):
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return {
+            "choices": [{"message": {"content": '{"answer": "ok", "notes": []}'}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }
+
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(acompletion=fake_acompletion))
+    client = LiteLLMOptimizerClient("openai/fake")
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "notes": {"type": "array", "items": {"type": "string"}, "default": []},
+        },
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+
+    await client.complete(
+        [{"role": "user", "content": "Return JSON."}],
+        response_schema=response_schema,
+    )
+
+    normalized = captured["response_format"]["json_schema"]["schema"]
+    assert normalized["required"] == ["answer", "notes"]
+    assert "default" not in normalized["properties"]["notes"]
+
+
+@pytest.mark.asyncio
+async def test_optimizer_client_retries_schema_errors_with_json_object(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError("Invalid schema for response_format 'x'")
+        return {
+            "choices": [{"message": {"content": '{"answer": "ok"}'}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }
+
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(acompletion=fake_acompletion))
+    client = LiteLLMOptimizerClient("openai/fake")
+
+    response = await client.complete(
+        [{"role": "user", "content": "Return JSON."}],
+        response_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+    )
+
+    assert calls[0]["response_format"]["type"] == "json_schema"
+    assert calls[1]["response_format"] == {"type": "json_object"}
+    assert response.output == '{"answer": "ok"}'
+    assert response.call_record.metadata["response_schema_fallback"] == "json_object"
