@@ -72,7 +72,7 @@ class GavelConfig:
     rejected_candidate_margin: float = 0.08
     prompt_complexity_margin: float = 0.02
     self_refine_rounds: int = 1
-    execution_modes: Tuple[str, ...] = ("direct", "plan", "self_refine")
+    execution_modes: Tuple[str, ...] = ("direct", "plan", "plan_refine", "self_refine")
     pareto_candidates: int = 6
     pareto_frontier_size: int = 6
     allow_code_execution: bool = False
@@ -576,6 +576,14 @@ async def _complete_with_execution_mode(
             target_client=target_client,
             metadata=metadata,
         )
+    if mode == "plan_refine":
+        return await _complete_with_planning(
+            prompt=prompt,
+            user_input=user_input,
+            target_client=target_client,
+            metadata=metadata,
+            refine_rounds=max(1, self_refine_rounds),
+        )
     raise ValueError(f"unsupported execution mode: {execution_mode}")
 
 
@@ -585,11 +593,13 @@ async def _complete_with_planning(
     user_input: Any,
     target_client: TargetClient,
     metadata: Mapping[str, Any],
+    refine_rounds: int = 0,
 ) -> tuple[Any, Any, int]:
+    execution_mode = "plan_refine" if refine_rounds > 0 else "plan"
     plan_metadata = {
         **dict(metadata),
         "phase": f"{metadata.get('phase', 'target')}_plan_contract",
-        "execution_mode": "plan",
+        "execution_mode": execution_mode,
     }
     plan_response = await target_client.complete(
         _planning_prompt(prompt),
@@ -599,19 +609,39 @@ async def _complete_with_planning(
     answer_metadata = {
         **dict(metadata),
         "phase": f"{metadata.get('phase', 'target')}_plan_answer",
-        "execution_mode": "plan",
+        "execution_mode": execution_mode,
     }
     answer_response = await target_client.complete(
         _planned_answer_prompt(prompt),
         _planned_answer_input(user_input, plan_response.output),
         metadata=answer_metadata,
     )
+    output = answer_response.output
+    call_count = 2
+    refinement_outputs: List[Any] = []
+    for round_index in range(refine_rounds):
+        refine_metadata = {
+            **dict(metadata),
+            "phase": f"{metadata.get('phase', 'target')}_plan_refine_{round_index + 1}",
+            "execution_mode": execution_mode,
+            "self_refine_round": round_index + 1,
+        }
+        refine_response = await target_client.complete(
+            _planned_refinement_prompt(prompt),
+            _planned_refinement_input(user_input, plan_response.output, output),
+            metadata=refine_metadata,
+        )
+        output = refine_response.output
+        refinement_outputs.append(output)
+        call_count += 1
     raw_output = {
-        "execution_mode": "plan",
+        "execution_mode": execution_mode,
         "task_contract": plan_response.output,
         "final_answer": answer_response.output,
+        "refined_answer": output if refine_rounds > 0 else None,
+        "refinement_outputs": refinement_outputs,
     }
-    return answer_response.output, raw_output, 2
+    return output, raw_output, call_count
 
 
 async def _complete_with_self_refinement(
@@ -799,6 +829,93 @@ def _planned_answer_input(user_input: Any, task_contract: Any) -> str:
         "Task contract from label-free planning pass:\n"
         f"{contract_text}\n\n"
         "Return only the final answer."
+    )
+
+
+def _planned_refinement_prompt(runtime_prompt: str) -> str:
+    clipped_prompt = _truncate_text(runtime_prompt.strip(), max_chars=9000)
+    sections = [
+        (
+            "Goal",
+            [
+                "Repair the draft final answer using the original prompt and the extracted task contract.",
+            ],
+        ),
+        (
+            "Context",
+            [
+                "This is a label-free verification pass. You do not have benchmark labels, hidden evaluator data, expected answers, or scorer feedback.",
+                "The runtime instructions that govern the final answer are included below. Apply them as authoritative guidance.",
+                clipped_prompt,
+            ],
+        ),
+        (
+            "Role",
+            [
+                "Act as a strict mechanical verifier and final-answer editor.",
+            ],
+        ),
+        (
+            "Input",
+            [
+                "You will receive the original user prompt, the extracted task contract, and a draft answer.",
+            ],
+        ),
+        (
+            "Task",
+            [
+                "Privately verify the draft against every hard constraint in the original prompt and task contract.",
+                "If a constraint is violated, rewrite only as much as needed to satisfy it.",
+                "For exact counts, first choose the target count, then count the final answer before returning it.",
+                "For no-repeat or uniqueness constraints, scan all words after lowercasing and stripping punctuation; replace repeats.",
+                "For no-consecutive constraints, check every adjacent word pair and repair any pair with the forbidden relation.",
+                "For word-property constraints, use only words you can verify letter-by-letter; vowels are {a,e,i,o,u}, consonants are all other letters, syllables are vowel clusters, and prime lengths are {2,3,5,7,11,13}.",
+                "For ratio, balance, or overlap constraints, compute the requested counts numerically and edit until the measured values match.",
+                "For boundary-chain constraints, compare exact normalized boundary words and repair mismatches.",
+                "For format constraints, make the visible surface form exact: delimiters, bullets, numbering, casing, quotes, whitespace, and line breaks.",
+                "If the draft is already compliant, return it unchanged.",
+            ],
+        ),
+        (
+            "Constraints",
+            [
+                "Do not mention verification, planning, the task contract, benchmark metadata, or hidden reasoning.",
+                "Do not add explanations, labels, markdown fences, or wrappers unless the original user prompt asks for them.",
+                "Obey the original user prompt over the task contract if they conflict.",
+            ],
+        ),
+        (
+            "Output Format",
+            [
+                "Return only the corrected final answer requested by the original prompt.",
+            ],
+        ),
+        (
+            "Quality Bar",
+            [
+                "The answer is complete only if the visible output itself satisfies the task; hidden analysis cannot rescue a constraint violation.",
+            ],
+        ),
+    ]
+    return _render_structured_sections(sections)
+
+
+def _planned_refinement_input(
+    user_input: Any,
+    task_contract: Any,
+    draft_output: Any,
+) -> str:
+    input_text = user_input if isinstance(user_input, str) else json.dumps(user_input, sort_keys=True)
+    contract_text = "" if task_contract is None else str(task_contract)
+    draft_text = "" if draft_output is None else str(draft_output)
+    return (
+        "Original user prompt:\n"
+        f"{input_text}\n\n"
+        "Task contract from label-free planning pass:\n"
+        f"{contract_text}\n\n"
+        "Draft final answer:\n"
+        f"{draft_text}\n\n"
+        "Return only the corrected final answer."
     )
 
 
@@ -1200,7 +1317,7 @@ def _render_structured_sections(sections: Sequence[tuple[str, Sequence[str]]]) -
     return "\n".join(lines).strip()
 
 
-_ALLOWED_EXECUTION_MODES = {"direct", "self_refine", "plan"}
+_ALLOWED_EXECUTION_MODES = {"direct", "self_refine", "plan", "plan_refine"}
 
 
 def _resolve_execution_mode(mode: str, self_refine_rounds: int) -> str:
@@ -1534,8 +1651,17 @@ async def _generate_pareto_prompt_candidates(
         max_candidates=requested,
     )
     frontier = _pareto_frontier(mutations, base_prompt=base_prompt)
-    ranked = _rank_pareto_mutations(frontier or mutations, base_prompt=base_prompt)
-    selected = ranked[:frontier_limit]
+    ranked_frontier = _rank_pareto_mutations(frontier, base_prompt=base_prompt)
+    if len(ranked_frontier) < frontier_limit:
+        frontier_ids = {id(mutation) for mutation in ranked_frontier}
+        backfill = [
+            mutation
+            for mutation in _rank_pareto_mutations(mutations, base_prompt=base_prompt)
+            if id(mutation) not in frontier_ids
+        ]
+        selected = (ranked_frontier + backfill)[:frontier_limit]
+    else:
+        selected = ranked_frontier[:frontier_limit]
     candidates = [
         _pareto_mutation_candidate(mutation, index=index)
         for index, mutation in enumerate(selected, start=1)
@@ -1600,16 +1726,19 @@ def _build_pareto_mutation_messages(
 GAVEL-Pareto mutation request
 
 Objective:
-- Propose at most {max_candidates} complete runtime prompts.
+- Propose exactly {max_candidates} complete runtime prompts unless the evidence is empty or unusable.
 - Each prompt must be a general candidate for unseen validation/test examples, not a benchmark-specific solver.
+- Each mutation.prompt must contain the full runtime prompt that should be sent to the target model. It must not be a diff, strategy note, title, or unchanged copy of the base prompt.
 - Use training failures to infer reusable behavioral contracts, output-shape policies, reasoning policies, demo policies, or anti-patterns.
 - Keep successful training rows as regression constraints.
 - Do not copy training answers, example ids, labels, hidden evaluator kwargs, or per-example expected outputs into runtime prompts.
 - Do not rely on scorer internals, benchmark metadata unavailable to the target model, or any held-out validation/test information.
-- Prefer candidates that are mutually diverse: one may be compact, one may be stricter about output format, one may add a self-check policy, one may add task-type-specific decision rules.
+- Diversity is mandatory. No two prompt fields may be identical or near-identical.
+- Cover distinct strategy families when possible: compact strict format, conservative verifier, task-type decision rules, failure-pattern repair, regression-preserving minimalism, and robust fallback for ambiguous prompts.
 - A candidate is useful only if a normal target model can execute it from the current user prompt alone.
 - Return complete prompts, not diffs. Preserve the eight-section style when possible: Goal, Context, Role, Input, Task, Constraints, Output Format, Quality Bar.
 - Include every schema field. Use [] for empty lists and null for no_mutation_reason when mutations are present.
+- Keep every prompt transferable. If a rule came from one training row, phrase it conditionally: "When the current prompt requests X, do Y."
 
 Base runtime prompt:
 {_truncate_text(base_prompt, max_chars=12000)}
@@ -2258,6 +2387,7 @@ def _candidate_priority(candidate: PromptCandidate) -> int:
 
 def _evaluation_candidate_priority(candidate: EvaluationCandidate) -> int:
     mode_priorities = {
+        "plan_refine": 4,
         "plan": 3,
         "self_refine": 2,
         "direct": 1,

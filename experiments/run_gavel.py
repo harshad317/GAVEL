@@ -135,10 +135,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--execution-modes",
-        default="direct,plan,self_refine",
+        default="direct,plan,plan_refine,self_refine",
         help=(
             "Comma-separated target execution modes considered by validation: "
-            "direct, plan, self_refine."
+            "direct, plan, plan_refine, self_refine."
         ),
     )
     parser.add_argument(
@@ -418,13 +418,13 @@ def _parse_execution_modes(value: str) -> tuple[str, ...]:
     )
     if not modes:
         raise SystemExit("--execution-modes must include at least one mode")
-    allowed = {"direct", "plan", "self_refine", "auto"}
+    allowed = {"direct", "plan", "plan_refine", "self_refine", "auto"}
     invalid = [mode for mode in modes if mode not in allowed]
     if invalid:
         raise SystemExit(
             "--execution-modes contains unsupported mode(s): "
             + ", ".join(invalid)
-            + ". Use direct, plan, self_refine, or auto."
+            + ". Use direct, plan, plan_refine, self_refine, or auto."
         )
     return modes
 
