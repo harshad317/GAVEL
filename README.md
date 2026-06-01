@@ -246,22 +246,21 @@ risk. The held-out validation gate scores the Pareto frontier alongside the
 benchmark-general task strategy prompt, stricter constraint-solver prompt,
 aggregate evidence strategy prompt, compiled GAVEL candidate, and target
 execution modes. By default it compares direct answering, label-free
-self-refinement, label-free plan-and-answer, and a contract-aware
-plan-answer-refine mode that first compiles the current user prompt into a task
-contract, drafts the answer from that contract, then runs a label-free repair
-pass against the original prompt plus the contract. A non-base prompt or
-non-direct execution mode is used only when it clears the base direct validation
-score by a confidence-aware effective margin. Canary-rejected and much longer
-prompts need extra validation lift before they can be selected, which reduces
-narrow prompt overfit. Use
+self-refinement, label-free plan-and-answer, a contract-aware plan-answer-refine
+mode, and a portfolio-select mode that drafts multiple label-free answers then
+uses a final constraint-focused referee pass to choose or repair one visible
+answer. A non-base prompt or non-direct execution mode is used only when it
+clears the base direct validation score by a confidence-aware effective margin.
+Canary-rejected and much longer prompts need extra validation lift before they
+can be selected, which reduces narrow prompt overfit. Use
 `--disable-pareto-search` for the older single-compile portfolio,
 `--disable-rejected-candidate-validation` for stricter canary-only ablations,
 or `--disable-prompt-portfolio` to score only the compiled candidate. The runner
 then evaluates the selected prompt and execution mode on train, validation, and
-test. Use `--execution-modes direct,plan,plan_refine,self_refine` to control the
-validation portfolio and `--self-refine-rounds` to set the depth of the
-self-refinement mode. It writes prediction JSONL, score JSONL, the full GAVEL optimization
-report, the selected prompt, and a summary JSON.
+test. Use `--execution-modes direct,plan,plan_refine,self_refine,portfolio_select`
+to control the validation portfolio and `--self-refine-rounds` to set the depth
+of the self-refinement mode. It writes prediction JSONL, score JSONL, the full
+GAVEL optimization report, the selected prompt, and a summary JSON.
 
 Base prompts and graph-rendered GAVEL prompts use the same compact structured
 prompt frame: `Goal`, `Context`, `Role`, `Input`, `Task`, `Constraints`,

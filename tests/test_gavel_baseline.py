@@ -227,6 +227,31 @@ class PlanTargetClient(FakeTargetClient):
         )
 
 
+class PortfolioTargetClient(FakeTargetClient):
+    async def complete(
+        self,
+        prompt: str,
+        input: Any,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ClientResponse:
+        del prompt, input
+        self.calls += 1
+        phase = str((metadata or {}).get("phase"))
+        if phase.endswith("_portfolio_select"):
+            output = "4"
+        elif phase.endswith("_plan_contract"):
+            output = '{"goal":"answer arithmetic","answer_shape":"number","hard_constraints":[],"solve_plan":["compute"],"final_checks":["number only"]}'
+        elif phase.endswith("_plan_answer"):
+            output = "4"
+        else:
+            output = "5"
+        return ClientResponse(
+            output=output,
+            raw=output,
+            call_record=_record(CallRole.TARGET, "target_complete", metadata),
+        )
+
+
 def _record(
     role: CallRole,
     name: str,
@@ -600,6 +625,27 @@ async def test_gavel_evaluation_can_plan_answer_then_refine_without_scorer_feedb
     assert predictions[0]["execution_mode"] == "plan_refine"
     assert scores[0].score == 1.0
     assert stats.api_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_gavel_evaluation_can_select_from_label_free_portfolio():
+    predictions, scores, stats = await evaluate_prompt(
+        prompt="answer",
+        examples=[_numeric_example("gsm8k:test:0")],
+        target_client=PortfolioTargetClient(),
+        allow_code_execution=False,
+        show_progress=False,
+        workers=1,
+        description="test",
+        phase="test",
+        self_refine_rounds=1,
+        execution_mode="portfolio_select",
+    )
+
+    assert predictions[0]["prediction"] == "4"
+    assert predictions[0]["execution_mode"] == "portfolio_select"
+    assert scores[0].score == 1.0
+    assert stats.api_calls == 6
 
 
 @pytest.mark.asyncio
