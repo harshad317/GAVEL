@@ -10,6 +10,7 @@ from pact_el.baselines.gavel import (
     GavelConfig,
     default_base_prompt,
     evaluate_prompt,
+    ifbench_prompt_playbook,
     run_gavel_baseline,
 )
 from pact_el.benchmarks.schemas import BenchmarkExample, BenchmarkSpec, BenchmarkTaskType, MetricKind
@@ -403,6 +404,29 @@ def test_default_base_prompt_is_benchmark_specific():
         "## Quality Bar",
     ):
         assert heading in prompt
+
+
+def test_ifbench_playbook_is_prompt_only():
+    prompt = ifbench_prompt_playbook(
+        BenchmarkSpec(
+            benchmark_id="ifbench",
+            display_name="IFBench",
+            task_type=BenchmarkTaskType.INSTRUCTION_FOLLOWING,
+            adapter="ifbench",
+            default_split="test",
+            metrics=[MetricKind.OFFICIAL_EVALUATOR],
+            official_url="official",
+            source_url="official",
+            evaluator="official",
+            sources=[],
+            description="Instruction following.",
+        )
+    )
+
+    assert prompt is not None
+    assert "Do not rely on hidden benchmark metadata" in prompt
+    assert "instruction_id_list" not in prompt
+    assert "kwargs" not in prompt
 
 
 def test_gavel_temperature_validation():

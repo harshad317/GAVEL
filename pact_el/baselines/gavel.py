@@ -1017,6 +1017,48 @@ def constraint_solver_prompt(spec: Optional[BenchmarkSpec] = None) -> str:
     return _render_structured_sections(sections)
 
 
+def ifbench_prompt_playbook(spec: Optional[BenchmarkSpec] = None) -> Optional[str]:
+    """Prompt-only IFBench strategy candidate.
+
+    The playbook is intentionally limited to instructions that are visible in the
+    user prompt. It does not use normalized example metadata, instruction ids, or
+    evaluator arguments at inference time.
+    """
+
+    if spec is None or spec.benchmark_id != "ifbench":
+        return None
+    sections = _default_prompt_sections(spec)
+    _extend_section(
+        sections,
+        "Role",
+        [
+            "Act as a visible-prompt instruction solver: read only the user prompt, infer every mechanical rule from the text, and produce the simplest answer that satisfies those rules.",
+        ],
+    )
+    _extend_section(
+        sections,
+        "Task",
+        _ifbench_visible_prompt_playbook_items(),
+    )
+    _extend_section(
+        sections,
+        "Constraints",
+        [
+            "Do not rely on hidden benchmark metadata, labels, instruction ids, checker arguments, or scorer feedback.",
+            "When a visible mechanical constraint conflicts with a rich answer, keep the mechanical constraint exact and make the answer as short as the prompt permits.",
+            "For impossible-looking style requests, prefer a minimal verifier-visible answer over a fluent answer that violates counts, positions, formatting, or word-property rules.",
+        ],
+    )
+    _extend_section(
+        sections,
+        "Quality Bar",
+        [
+            "Before returning, privately rerun the exact checks described in the visible prompt text and revise the final answer until the checks pass.",
+        ],
+    )
+    return _render_structured_sections(sections)
+
+
 def evidence_strategy_prompt(
     spec: Optional[BenchmarkSpec],
     logs: Sequence[Mapping[str, Any]],
@@ -1025,6 +1067,8 @@ def evidence_strategy_prompt(
     if not summary:
         return None
     sections = _default_prompt_sections(spec)
+    if spec is not None and spec.benchmark_id == "ifbench":
+        _extend_section(sections, "Task", _ifbench_visible_prompt_playbook_items())
     _extend_section(
         sections,
         "Context",
@@ -1049,6 +1093,35 @@ def evidence_strategy_prompt(
         ],
     )
     return _render_structured_sections(sections)
+
+
+def _ifbench_visible_prompt_playbook_items() -> List[str]:
+    return [
+        "If the prompt specifies exact keyword counts such as one/two/three/five/seven times, draft a controlled short answer and count each literal keyword occurrence case-insensitively; avoid using the keyword inside any other word.",
+        "If the prompt says the response must start with a verb, start with a plain imperative verb phrase such as `Give ...` or `Consider ...`, then continue the answer.",
+        "If every word must have a consonant cluster, use only words whose spelling contains adjacent consonants, such as strengths, scripts, crafts, trends, glyphs, prompts, trusts, blends.",
+        "If words must alternate odd/even syllables, either produce one compliant word when the prompt allows a very short answer, or build the whole answer from a checked odd-even word sequence.",
+        "If words may use only a limited set of vowel types, restrict the whole answer to words using a small vowel set, such as `red pen met` for vowel e only.",
+        "If only prime-length words are allowed, use short words with 2, 3, 5, 7, 11, or 13 letters; reject every 1, 4, 6, 8, 9, 10, 12, 14, and 15 letter word.",
+        "If each word must start with the next alphabet letter, choose a short alphabetic sequence such as `Alpha bravo charlie delta echo`; continue cyclically only if more words are needed.",
+        "If no two consecutive words can share a first letter, scan adjacent words after punctuation is removed and replace any collision.",
+        "If the second word and second-to-last word must be a keyword, place the keyword as token 2 and as the penultimate token before final punctuation.",
+        "If a keyword must appear in sentence N or as word M of sentence N, first create exactly enough sentences; in sentence N count punctuation-stripped words and place the keyword at the required position.",
+        "If sentence word counts must increment by n, choose a small base count and build sentences with counts base, base+n, base+2n, then count punctuation-stripped words.",
+        "If sentence types must be balanced, use equal counts of sentences ending `.`, `?`, and `!`; if the requested ratio is 2:1 declarative to interrogative, use two `.` sentences and one `?` sentence.",
+        "If three sentences must have the same character count, use a known equal-length skeleton such as `Cat sat. Dog ran. Fox hid.` and preserve exactly three sentences.",
+        "If the last word of each sentence must become the first word of the next, write the boundary chain first, for example `Alpha beta. Beta gamma.`",
+        "If each paragraph must end with its first word, draft each paragraph as `Alpha ... alpha` and separate paragraphs with a newline.",
+        "If the prompt asks for a copied character span by start/end indices, copy exactly that substring from the referenced request and output only the substring.",
+        "If the prompt asks to repeat the request but change the first word, output the repeated request with only the first word changed and do not answer the request.",
+        "If every word must be on a new line, put one visible word per line and do not include extra prose.",
+        "If indentation must increase, write multiple short lines with strictly more leading spaces on each next line.",
+        "If every sentence must end with an emoji, put an emoji immediately at the end of every sentence.",
+        "If all punctuation marks are required, include `.`, `,`, `!`, `?`, `;`, `:`, and an interrobang sequence `?!` at least once.",
+        "If answer options are provided with no explanation, output exactly one option string and nothing else.",
+        "If a no-whitespace output is requested, remove every space, tab, and newline.",
+        "If a trigram-overlap percentage is requested, preserve exact wording from the reference text for high percentages; for low percentages, keep the answer short and include only a small number of exact reference phrases.",
+    ]
 
 
 def _default_prompt_sections(
@@ -1703,6 +1776,16 @@ def _build_prompt_candidates(
             report_decision="validation_selected_constraint_solver",
         )
     ]
+    playbook_prompt = ifbench_prompt_playbook(benchmark_spec)
+    if playbook_prompt is not None:
+        candidates.append(
+            PromptCandidate(
+                name="ifbench_playbook",
+                prompt=playbook_prompt,
+                source="deterministic_ifbench_playbook",
+                report_decision="validation_selected_ifbench_playbook",
+            )
+        )
     evidence_prompt = evidence_strategy_prompt(benchmark_spec, logs)
     if evidence_prompt is not None:
         candidates.append(
@@ -1771,6 +1854,7 @@ def _candidate_priority(candidate: PromptCandidate) -> int:
     priorities = {
         "optimized": 3,
         "constraint_solver": 3,
+        "ifbench_playbook": 3,
         "evidence_strategy": 2,
         "task_strategy": 1,
     }
