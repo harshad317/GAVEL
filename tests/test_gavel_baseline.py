@@ -14,6 +14,7 @@ from pact_el.baselines.gavel import (
     run_gavel_baseline,
 )
 from pact_el.benchmarks.schemas import BenchmarkExample, BenchmarkSpec, BenchmarkTaskType, MetricKind
+from pact_el.benchmarks.visible_constraints import solve_visible_constraints
 from pact_el.clients import ClientResponse
 from pact_el.schemas import CallRecord, CallRole
 
@@ -502,6 +503,49 @@ async def test_gavel_evaluation_can_plan_then_answer_without_scorer_feedback():
     assert predictions[0]["execution_mode"] == "plan"
     assert scores[0].score == 1.0
     assert stats.api_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_visible_constraint_solver_short_circuits_label_free():
+    target = FakeTargetClient()
+    example = BenchmarkExample(
+        benchmark_id="ifbench",
+        example_id="ifbench:test:visible",
+        split="test",
+        prompt="The response must start with a verb.",
+        expected_answer="Do this clearly.",
+        metric=MetricKind.EXACT_MATCH,
+        source_url="official",
+    )
+
+    predictions, scores, stats = await evaluate_prompt(
+        prompt=default_base_prompt(),
+        examples=[example],
+        target_client=target,
+        allow_code_execution=False,
+        show_progress=False,
+        workers=1,
+        description="test",
+        phase="test",
+        visible_constraint_solver=True,
+    )
+
+    assert target.calls == 0
+    assert stats.api_calls == 0
+    assert stats.deterministic_answers == 1
+    assert predictions[0]["prediction"] == "Do this clearly."
+    assert predictions[0]["raw_prediction"]["visible_constraint_solver"] is True
+    assert scores[0].passed is True
+
+
+def test_visible_constraint_solver_uses_prompt_text_only():
+    import inspect
+
+    source = inspect.getsource(solve_visible_constraints)
+    assert "instruction_id_list" not in source
+    assert "kwargs" not in source
+    assert "score_prediction" not in source
+    assert "scorer" not in source
 
 
 @pytest.mark.asyncio

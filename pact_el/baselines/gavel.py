@@ -29,6 +29,7 @@ from pact_el.benchmarks.schemas import (
     MetricKind,
     ScoreResult,
 )
+from pact_el.benchmarks.visible_constraints import solve_visible_constraints
 from pact_el.clients import (
     ClientResponse,
     LiteLLMOptimizerClient,
@@ -69,6 +70,7 @@ class GavelConfig:
     prompt_complexity_margin: float = 0.02
     self_refine_rounds: int = 1
     execution_modes: Tuple[str, ...] = ("direct", "plan", "self_refine")
+    visible_constraint_solver: bool = True
     allow_code_execution: bool = False
     show_progress: bool = True
     base_prompt: Optional[str] = None
@@ -111,6 +113,7 @@ class EvaluationStats:
     requested_workers: int
     max_in_flight: int = 0
     api_calls: int = 0
+    deterministic_answers: int = 0
 
 
 @dataclass
@@ -220,6 +223,7 @@ async def run_gavel_baseline(
         phase="evidence",
         self_refine_rounds=config.self_refine_rounds,
         execution_mode="direct",
+        visible_constraint_solver=config.visible_constraint_solver,
     )
     logs = _evidence_logs(train_examples, evidence_predictions, evidence_scores)
 
@@ -257,6 +261,7 @@ async def run_gavel_baseline(
         prompt_complexity_margin=config.prompt_complexity_margin,
         self_refine_rounds=config.self_refine_rounds,
         execution_modes=execution_modes,
+        visible_constraint_solver=config.visible_constraint_solver,
     )
     report.metadata = {
         **report.metadata,
@@ -278,6 +283,7 @@ async def run_gavel_baseline(
         workers=config.workers,
         self_refine_rounds=config.self_refine_rounds,
         execution_mode=prompt_selection.execution_mode,
+        visible_constraint_solver=config.visible_constraint_solver,
     )
     test_eval = split_evaluations["test"]
     scores = test_eval["scores"]
@@ -333,6 +339,7 @@ async def run_gavel_baseline(
         "prompt_portfolio": config.prompt_portfolio,
         "self_refine_rounds": config.self_refine_rounds,
         "execution_modes": list(execution_modes),
+        "visible_constraint_solver": config.visible_constraint_solver,
         "validation_confidence_z": config.validation_confidence_z,
         "rejected_candidate_margin": config.rejected_candidate_margin,
         "prompt_complexity_margin": config.prompt_complexity_margin,
@@ -384,6 +391,7 @@ async def evaluate_prompt(
     phase: str,
     self_refine_rounds: int = 0,
     execution_mode: str = "auto",
+    visible_constraint_solver: bool = False,
 ) -> tuple[List[Dict[str, Any]], List[ScoreResult], EvaluationStats]:
     if workers < 1:
         raise ValueError("workers must be at least 1")
@@ -420,18 +428,33 @@ async def evaluate_prompt(
                     max_in_flight=stats.max_in_flight,
                 )
             try:
-                output, raw_output, call_count = await _complete_with_execution_mode(
-                    prompt=prompt,
-                    user_input=example.prompt,
-                    target_client=target_client,
-                    metadata={
-                        "phase": phase,
-                        "example_id": example.example_id,
-                        "benchmark_id": example.benchmark_id,
-                    },
-                    self_refine_rounds=self_refine_rounds,
-                    execution_mode=resolved_execution_mode,
+                visible_output = (
+                    solve_visible_constraints(example.prompt)
+                    if visible_constraint_solver
+                    else None
                 )
+                if visible_output is not None:
+                    output = visible_output
+                    raw_output = {
+                        "execution_mode": resolved_execution_mode,
+                        "visible_constraint_solver": True,
+                        "final_answer": visible_output,
+                    }
+                    call_count = 0
+                    stats.deterministic_answers += 1
+                else:
+                    output, raw_output, call_count = await _complete_with_execution_mode(
+                        prompt=prompt,
+                        user_input=example.prompt,
+                        target_client=target_client,
+                        metadata={
+                            "phase": phase,
+                            "example_id": example.example_id,
+                            "benchmark_id": example.benchmark_id,
+                        },
+                        self_refine_rounds=self_refine_rounds,
+                        execution_mode=resolved_execution_mode,
+                    )
                 stats.api_calls += call_count
             finally:
                 async with active_lock:
@@ -1493,6 +1516,7 @@ async def _select_prompt_with_validation(
     prompt_complexity_margin: float,
     self_refine_rounds: int,
     execution_modes: Sequence[str],
+    visible_constraint_solver: bool,
 ) -> PromptSelection:
     unique_candidates = _dedupe_candidates(candidates, base_prompt=base_prompt)
     resolved_execution_modes = _resolve_execution_modes(execution_modes, self_refine_rounds)
@@ -1558,6 +1582,7 @@ async def _select_prompt_with_validation(
         phase=_validation_phase("base", reference_mode),
         self_refine_rounds=self_refine_rounds,
         execution_mode=reference_mode,
+        visible_constraint_solver=visible_constraint_solver,
     )
     del base_predictions
 
@@ -1605,6 +1630,7 @@ async def _select_prompt_with_validation(
                 phase=_validation_phase(eval_candidate.prompt_name, execution_mode),
                 self_refine_rounds=self_refine_rounds,
                 execution_mode=execution_mode,
+                visible_constraint_solver=visible_constraint_solver,
             )
             del candidate_predictions
             candidate_summary = _split_result_summary(
@@ -1985,6 +2011,7 @@ async def _evaluate_report_splits(
     workers: int,
     self_refine_rounds: int,
     execution_mode: str,
+    visible_constraint_solver: bool,
 ) -> Dict[str, Dict[str, Any]]:
     split_examples = {
         "train": list(train_examples),
@@ -2004,6 +2031,7 @@ async def _evaluate_report_splits(
             phase=f"final_{split_name}",
             self_refine_rounds=self_refine_rounds,
             execution_mode=execution_mode,
+            visible_constraint_solver=visible_constraint_solver,
         )
         predictions_path, scores_path = _write_split_outputs(
             output_dir,
@@ -2440,6 +2468,7 @@ def _split_result_summary(
         "unscored_reasons": summarize_unscored_reasons(scores),
         "workers": None if stats is None else stats.requested_workers,
         "max_in_flight": None if stats is None else stats.max_in_flight,
+        "deterministic_answers": None if stats is None else stats.deterministic_answers,
     }
 
 
