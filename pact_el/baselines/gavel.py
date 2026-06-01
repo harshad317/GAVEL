@@ -621,6 +621,10 @@ def _planning_prompt(runtime_prompt: str) -> str:
                 "Identify counts, ordering, required text, forbidden text, casing, delimiters, language, units, choices, code requirements, and edge cases when present.",
                 "For reasoning tasks, identify the shortest path to the final answer and the normalized output expected by the prompt.",
                 "For creative or open-ended tasks, identify the mechanical constraints that must still be satisfied exactly.",
+                "For word-property constraints (vowel start/end, consonant clusters, consonant counts, syllable parity, prime word lengths, alphabetical order, first/last letters): pre-select a verified pool of at least 10 candidate words that satisfy the property; record them in word_pools so the answer pass can draw from them without guessing. Verify each candidate explicitly: vowels are {a,e,i,o,u}; consonants are all other letters; syllables = number of vowel clusters; prime lengths are {2,3,5,7,11,13}.",
+                "For position-chain constraints (last word of sentence/paragraph = first word of the next): write out the complete ordered list of boundary words before anything else.",
+                "For ratio or overlap constraints: compute the target value numerically and record it (e.g., 'overlap ratio must be 0.5: out of N content words, M must appear in both sections').",
+                "For repeated-span constraints: write the exact span once, then note how many copies and what modifications are allowed.",
             ],
         ),
         (
@@ -634,14 +638,17 @@ def _planning_prompt(runtime_prompt: str) -> str:
         (
             "Output Format",
             [
-                "Return JSON with keys: goal, answer_shape, hard_constraints, solve_plan, final_checks.",
+                "Return JSON with keys: goal, answer_shape, hard_constraints, word_pools, boundary_chain, ratio_targets, solve_plan, final_checks.",
+                "word_pools: object mapping each word-property constraint name to an array of pre-verified candidate words (empty object if no word-property constraints).",
+                "boundary_chain: ordered array of boundary words for chaining constraints (empty array if not applicable).",
+                "ratio_targets: object mapping each ratio/overlap constraint to its numeric target and how to measure it (empty object if not applicable).",
                 "Use short strings or arrays of short strings. Do not include markdown fences.",
             ],
         ),
         (
             "Quality Bar",
             [
-                "The contract is complete only if a second pass can use it to produce an answer that a strict verifier could score.",
+                "The contract is complete only if a second pass can use it—including word_pools and boundary_chain—to produce an answer that a strict mechanical verifier could score without additional guessing.",
             ],
         ),
     ]
@@ -690,6 +697,9 @@ def _planned_answer_prompt(runtime_prompt: str) -> str:
             "Task",
             [
                 "Solve the original user prompt directly.",
+                "For word-property constraints: use ONLY words from the contract's word_pools. Do not use any word outside the pool for a property-constrained position unless you can explicitly verify it letter-by-letter satisfies the property.",
+                "For chaining constraints: follow the boundary_chain exactly; the last word of each sentence or paragraph must match the first word of the next.",
+                "For ratio or overlap constraints: use ratio_targets as the numeric goal and verify it after drafting.",
                 "Use the task contract to satisfy every hard constraint before optimizing style or elaboration.",
                 "Privately run the final checks from the contract and minimally revise any failing part.",
             ],
@@ -764,8 +774,14 @@ def _self_refinement_prompt(runtime_prompt: str) -> str:
             [
                 "Privately extract every explicit requirement from the original user prompt.",
                 "Check the draft against task intent, output format, counts, ordering, required content, prohibited content, and surface-form constraints.",
+                "For vowel or consonant constraints: go word-by-word through the draft. Vowels are {a,e,i,o,u}; consonants are all other letters. Flag any word that violates the constraint and replace it.",
+                "For syllable odd/even or syllable-count constraints: count vowel clusters per word (each consecutive group of vowels = one syllable). Flag any word with wrong parity or count and replace it.",
+                "For prime word-length constraints: prime lengths ≤ 15 are {2,3,5,7,11,13}. Count each word's letters and flag violations.",
+                "For consonant-cluster constraints: scan each word for consecutive consonant pairs. If any word has no consecutive consonants, replace it with one that does.",
+                "For ratio or overlap constraints: count actual values from the draft numerically, compute the ratio, and edit until it matches the requirement.",
+                "For position-chain constraints: verify the exact last word of each sentence or paragraph matches the exact first word of the next. Fix any mismatch by adjusting the boundary word.",
                 "If the draft is already correct, return it unchanged.",
-                "If the draft violates any requirement, minimally rewrite it until the final answer satisfies the requirements.",
+                "If the draft violates any requirement, minimally rewrite the failing parts until all constraints are satisfied.",
             ],
         ),
         (
