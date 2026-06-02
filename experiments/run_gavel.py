@@ -158,6 +158,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable optimizer-proposed GAVEL-Pareto prompt mutation search.",
     )
+    parser.add_argument(
+        "--demo-candidates",
+        type=int,
+        default=4,
+        help="Few-shot prompt variants to build from accepted training outputs before validation.",
+    )
+    parser.add_argument(
+        "--demos-per-candidate",
+        type=int,
+        default=3,
+        help="Accepted training demonstrations included in each few-shot prompt variant.",
+    )
+    parser.add_argument(
+        "--disable-demo-search",
+        action="store_true",
+        help="Disable few-shot prompt variants built from accepted training outputs.",
+    )
     parser.add_argument("--prompt", help="Override the default base prompt.")
     parser.add_argument("--prompt-file", help="Read the base prompt from a file.")
     parser.add_argument(
@@ -220,6 +237,8 @@ async def async_main() -> None:
         execution_modes=_parse_execution_modes(args.execution_modes),
         pareto_candidates=0 if args.disable_pareto_search else args.pareto_candidates,
         pareto_frontier_size=args.pareto_frontier_size,
+        demo_candidates=0 if args.disable_demo_search else args.demo_candidates,
+        demos_per_candidate=args.demos_per_candidate,
         allow_code_execution=args.allow_code_execution,
         show_progress=not args.no_progress,
         base_prompt=base_prompt,
@@ -278,6 +297,8 @@ async def async_main() -> None:
                 "execution_modes": args.execution_modes,
                 "pareto_candidates": 0 if args.disable_pareto_search else args.pareto_candidates,
                 "pareto_frontier_size": args.pareto_frontier_size,
+                "demo_candidates": 0 if args.disable_demo_search else args.demo_candidates,
+                "demos_per_candidate": args.demos_per_candidate,
                 "train_n": train_n,
                 "val_n": val_n,
                 "test_n": test_n,

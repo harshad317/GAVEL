@@ -81,6 +81,8 @@ class GavelConfig:
     )
     pareto_candidates: int = 6
     pareto_frontier_size: int = 6
+    demo_candidates: int = 4
+    demos_per_candidate: int = 3
     allow_code_execution: bool = False
     show_progress: bool = True
     base_prompt: Optional[str] = None
@@ -106,6 +108,10 @@ class GavelConfig:
             raise ValueError("pareto_candidates must be non-negative")
         if self.pareto_frontier_size < 0:
             raise ValueError("pareto_frontier_size must be non-negative")
+        if self.demo_candidates < 0:
+            raise ValueError("demo_candidates must be non-negative")
+        if self.demos_per_candidate < 0:
+            raise ValueError("demos_per_candidate must be non-negative")
         _resolve_execution_modes(self.execution_modes, self.self_refine_rounds)
 
 
@@ -301,6 +307,12 @@ async def run_gavel_baseline(
         benchmark_spec=benchmark_spec,
         logs=logs,
         pareto_candidates=pareto_search.candidates,
+        demo_candidates=(
+            config.demo_candidates
+            if config.prompt_portfolio and config.validation_gate
+            else 0
+        ),
+        demos_per_candidate=config.demos_per_candidate,
         enabled=config.prompt_portfolio,
         validate_rejected_candidates=config.validate_rejected_candidates,
     )
@@ -399,6 +411,8 @@ async def run_gavel_baseline(
         "pareto_candidates": config.pareto_candidates,
         "pareto_frontier_size": config.pareto_frontier_size,
         "pareto_search": pareto_search.summary,
+        "demo_candidates": config.demo_candidates,
+        "demos_per_candidate": config.demos_per_candidate,
         "self_refine_rounds": config.self_refine_rounds,
         "execution_modes": list(execution_modes),
         "validation_confidence_z": config.validation_confidence_z,
@@ -1395,6 +1409,107 @@ def evidence_strategy_prompt(
         ],
     )
     return _render_structured_sections(sections)
+
+
+def demo_success_prompt_candidates(
+    base_prompt: str,
+    logs: Sequence[Mapping[str, Any]],
+    *,
+    max_candidates: int,
+    demos_per_candidate: int,
+) -> List[PromptCandidate]:
+    if max_candidates <= 0 or demos_per_candidate <= 0:
+        return []
+    demonstrations = _accepted_demonstrations(logs)
+    if not demonstrations:
+        return []
+    candidates: List[PromptCandidate] = []
+    for index in range(max_candidates):
+        selected = _select_demo_window(
+            demonstrations,
+            start=index,
+            count=demos_per_candidate,
+        )
+        if not selected:
+            break
+        prompt = _append_demonstrations_to_prompt(base_prompt, selected)
+        candidates.append(
+            PromptCandidate(
+                name=f"demo_success_{index + 1}",
+                prompt=prompt,
+                source="fewshot_success_demos",
+                report_decision="validation_selected_demo_success",
+            )
+        )
+    return candidates
+
+
+def _accepted_demonstrations(
+    logs: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, str]]:
+    demos: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in logs:
+        if row.get("passed") is not True:
+            continue
+        user_input = str(row.get("input") or "").strip()
+        output = str(row.get("output") or "").strip()
+        if not user_input or not output:
+            continue
+        key = (user_input, output)
+        if key in seen:
+            continue
+        seen.add(key)
+        demos.append(
+            {
+                "input": _truncate_text(user_input, max_chars=900),
+                "output": _truncate_text(output, max_chars=500),
+            }
+        )
+    return demos
+
+
+def _select_demo_window(
+    demonstrations: Sequence[Mapping[str, str]],
+    *,
+    start: int,
+    count: int,
+) -> List[Mapping[str, str]]:
+    if not demonstrations or count <= 0:
+        return []
+    ordered = sorted(
+        demonstrations,
+        key=lambda demo: (
+            (start + len(str(demo.get("input") or ""))) % max(1, len(demonstrations)),
+            len(str(demo.get("output") or "")),
+        ),
+    )
+    offset = start % len(ordered)
+    rotated = list(ordered[offset:]) + list(ordered[:offset])
+    return rotated[: min(count, len(rotated))]
+
+
+def _append_demonstrations_to_prompt(
+    base_prompt: str,
+    demonstrations: Sequence[Mapping[str, str]],
+) -> str:
+    lines = [base_prompt.strip(), "", "## Demonstrations"]
+    lines.append(
+        "- The following training examples had accepted outputs. Use them to infer transferable answer discipline, not to copy topics, wording, labels, or answers."
+    )
+    lines.append("- For a new user prompt, obey the new prompt over any demonstration.")
+    for index, demo in enumerate(demonstrations, start=1):
+        lines.extend(
+            [
+                "",
+                f"### Demo {index}",
+                "User prompt:",
+                str(demo.get("input") or ""),
+                "Accepted answer:",
+                str(demo.get("output") or ""),
+            ]
+        )
+    return "\n".join(lines).strip()
 
 
 def _default_prompt_sections(
@@ -2446,6 +2561,8 @@ def _build_prompt_candidates(
     benchmark_spec: Optional[BenchmarkSpec],
     logs: Sequence[Mapping[str, Any]],
     pareto_candidates: Sequence[PromptCandidate],
+    demo_candidates: int,
+    demos_per_candidate: int,
     enabled: bool,
     validate_rejected_candidates: bool,
 ) -> List[PromptCandidate]:
@@ -2481,6 +2598,14 @@ def _build_prompt_candidates(
             report_decision="validation_selected_constraint_solver",
         )
     ]
+    candidates.extend(
+        demo_success_prompt_candidates(
+            base_prompt,
+            logs,
+            max_candidates=demo_candidates,
+            demos_per_candidate=demos_per_candidate,
+        )
+    )
     candidates.extend(pareto_candidates)
     evidence_prompt = evidence_strategy_prompt(benchmark_spec, logs)
     if evidence_prompt is not None:
@@ -2548,6 +2673,8 @@ def _preferred_candidate(candidates: Sequence[PromptCandidate]) -> Optional[Prom
 
 def _candidate_priority(candidate: PromptCandidate) -> int:
     if candidate.name.startswith("pareto_") or candidate.source.startswith("pareto:"):
+        return 5
+    if candidate.source == "fewshot_success_demos":
         return 4
     priorities = {
         "optimized": 3,

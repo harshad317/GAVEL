@@ -234,6 +234,8 @@ python3 experiments/run_gavel.py \
   --budget 9 \
   --pareto-candidates 6 \
   --pareto-frontier-size 6 \
+  --demo-candidates 4 \
+  --demos-per-candidate 3 \
   --validation-margin 0.0 \
   --out output/baselines/ifbench_gavel
 ```
@@ -242,10 +244,12 @@ The GAVEL runner first evaluates the base prompt on the selected train examples
 to build an Evidence Ledger, compiles one typed PACT-EL/GAVEL prompt, then runs
 GAVEL-Pareto: an optimizer-proposed population of complete prompt mutations
 ranked for expected gain, evidence support, compactness, and low regression
-risk. The held-out validation gate scores the Pareto frontier alongside the
-benchmark-general task strategy prompt, stricter constraint-solver prompt,
-aggregate evidence strategy prompt, compiled GAVEL candidate, and target
-execution modes. By default it compares direct answering, label-free
+risk. It also builds a small few-shot demo portfolio from accepted training
+outputs, giving GAVEL the same broad instruction-plus-demonstration search
+surface that MIPRO-style methods use. The held-out validation gate scores the
+Pareto frontier and demo variants alongside the benchmark-general task strategy
+prompt, stricter constraint-solver prompt, aggregate evidence strategy prompt,
+compiled GAVEL candidate, and target execution modes. By default it compares direct answering, label-free
 self-refinement, label-free plan-and-answer, a contract-aware plan-answer-refine
 mode, and a portfolio-select mode that drafts multiple label-free answers then
 uses a final constraint-focused referee pass to choose or repair one visible
@@ -254,6 +258,7 @@ clears the base direct validation score by a confidence-aware effective margin.
 Canary-rejected and much longer prompts need extra validation lift before they
 can be selected, which reduces narrow prompt overfit. Use
 `--disable-pareto-search` for the older single-compile portfolio,
+`--disable-demo-search` to ablate few-shot training demonstrations,
 `--disable-rejected-candidate-validation` for stricter canary-only ablations,
 or `--disable-prompt-portfolio` to score only the compiled candidate. The runner
 then evaluates the selected prompt and execution mode on train, validation, and

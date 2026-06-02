@@ -252,6 +252,34 @@ class PortfolioTargetClient(FakeTargetClient):
         )
 
 
+class DemoTargetClient(FakeTargetClient):
+    async def complete(
+        self,
+        prompt: str,
+        input: Any,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ClientResponse:
+        self.calls += 1
+        phase = str((metadata or {}).get("phase"))
+        if (metadata or {}).get("canary_id"):
+            output = '{"priority": "urgent"}'
+        elif phase == "evidence":
+            output = "4"
+        elif phase.startswith("validation_gate_demo_success_"):
+            output = "4"
+        elif phase == "final_test" and "## Demonstrations" in prompt:
+            output = "4"
+        elif "2+2" in str(input):
+            output = "5"
+        else:
+            output = "A"
+        return ClientResponse(
+            output=output,
+            raw=output,
+            call_record=_record(CallRole.TARGET, "target_complete", metadata),
+        )
+
+
 def _record(
     role: CallRole,
     name: str,
@@ -448,6 +476,43 @@ async def test_gavel_validation_gate_can_select_task_strategy_from_portfolio(
 
 
 @pytest.mark.asyncio
+async def test_gavel_demo_candidate_can_win_validation(
+    tmp_path,
+    sample_compiler_output,
+):
+    config = GavelConfig(
+        model="fake-target",
+        optimizer_model="fake-optimizer",
+        output_dir=tmp_path,
+        cache=False,
+        workers=2,
+        show_progress=False,
+        validation_gate=True,
+        prompt_portfolio=True,
+        self_refine_rounds=0,
+        execution_modes=("direct",),
+        pareto_candidates=0,
+        demo_candidates=1,
+        demos_per_candidate=1,
+    )
+    result = await run_gavel_baseline(
+        train_examples=[_numeric_example("gsm8k:train:0")],
+        val_examples=[_numeric_example("gsm8k:validation:0")],
+        test_examples=[_numeric_example("gsm8k:test:0")],
+        config=config,
+        benchmark_spec=_spec(),
+        optimizer_client=FakeOptimizerClient(sample_compiler_output.model_dump_json()),
+        target_client=DemoTargetClient(),
+    )
+
+    gate = result.summary["validation_gate"]
+    assert result.summary["selected_prompt"].startswith("demo_success_")
+    assert result.summary["decision"] == "validation_override"
+    assert gate["candidate_source"] == "fewshot_success_demos"
+    assert result.summary["split_results"]["test"]["score"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_gavel_pareto_candidate_can_win_validation(
     tmp_path,
     sample_compiler_output,
@@ -543,6 +608,12 @@ def test_gavel_temperature_validation():
 
     with pytest.raises(ValueError, match="pareto_candidates must be non-negative"):
         GavelConfig(pareto_candidates=-1).validate()
+
+    with pytest.raises(ValueError, match="demo_candidates must be non-negative"):
+        GavelConfig(demo_candidates=-1).validate()
+
+    with pytest.raises(ValueError, match="demos_per_candidate must be non-negative"):
+        GavelConfig(demos_per_candidate=-1).validate()
 
     with pytest.raises(ValueError, match="execution mode must be one of"):
         GavelConfig(execution_modes=("unsupported",)).validate()
